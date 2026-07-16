@@ -103,6 +103,16 @@ RETURNING t.id, t.task_name, t.args, t.kwargs, t.retry_count, t.max_retries, t.t
 // parity with horsies PR #160). The xact-scoped locks live only for the
 // statement's own transaction — never across a client round trip. Replaces
 // the per-pass lock loop + count statements + per-queue CLAIM_SQL loop.
+//
+// NOTE: the Python implementation's horsies_claim (its schema v12) returns an
+// extra trailing OUT column, claimed_at — its C10 claim-generation fence.
+// Same invariant as this crate's started_at fence; across Python's process
+// boundary the claim-time marker is the one its finalizer holds. Shared-
+// database interoperability is BLOCKED on this divergence: 0024 cannot apply
+// against a Python-v12 schema (return-type change), and a drop-first apply
+// would remove the column Python's fence reads. Before any shared-DB
+// deployment, adopt the v12 return shape (append claimed_at) — harmless
+// here, since this SELECT names its columns.
 const HORSIES_CLAIM_SQL: &str = "\
 SELECT id, task_name, args, kwargs, retry_count, max_retries, task_options, \
        queue_name, good_until, is_workflow_task \
