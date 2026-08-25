@@ -15,7 +15,7 @@ use crate::core::history::names::{
 use crate::core::history::outcomes::{CatalogConflictKind, LeafCreation, LeafDrop, LeafInspection};
 use crate::core::history::partitions::catalog::{
     capture_partition_bound_utc, database_now, read_leaf_catalog_row, read_leaf_physical_state,
-    read_retention_class, INDEX_SCHEMA_VERSION,
+    read_retention_class, LeafIndexKind, INDEX_SCHEMA_VERSION,
 };
 use crate::core::history::partitions::locks::{
     try_lock_leaf_for_transaction, try_lock_relation_exclusive_for_transaction, LeafLockAttempt,
@@ -248,6 +248,8 @@ pub async fn create_hourly_heartbeat_leaf(
         catalog
             .as_ref()
             .map_or(index_name.as_str(), |row| row.id_index_name.as_str()),
+        leaf.bounds(),
+        LeafIndexKind::Heartbeat,
     )
     .await?;
     if physical.relation_exists != catalog.is_some() {
@@ -275,11 +277,14 @@ pub async fn create_hourly_heartbeat_leaf(
                 detail: "existing leaf metadata differs from the request".to_owned(),
             });
         }
-        if physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str()) {
+        if physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str())
+            || !physical.partition_bound_matches_expected
+        {
             return Ok(LeafCreation::CatalogConflict {
                 leaf_name: leaf.leaf_name().to_owned(),
                 kind: CatalogConflictKind::PhysicalNonconformant,
-                detail: "attached leaf partition bound differs from catalog".to_owned(),
+                detail: "attached leaf partition bound differs from catalog or requested bounds"
+                    .to_owned(),
             });
         }
         if physical.detach_pending != Some(false) {
@@ -290,7 +295,7 @@ pub async fn create_hourly_heartbeat_leaf(
                     .to_owned(),
             });
         }
-        if !physical.id_index_exists {
+        if !physical.id_index_conformant {
             if matches!(
                 try_lock_relation_exclusive_for_transaction(connection, leaf.leaf_name()).await?,
                 LeafLockAttempt::Busy
@@ -298,6 +303,22 @@ pub async fn create_hourly_heartbeat_leaf(
                 return Ok(LeafCreation::Busy {
                     leaf_name: leaf.leaf_name().to_owned(),
                 });
+            }
+            match (physical.id_index_relation_exists, physical.id_index_exists) {
+                (false, _) => {}
+                (true, true) => {
+                    sqlx::query(&format!("DROP INDEX {}", catalog.id_index_name))
+                        .execute(&mut *connection)
+                        .await?;
+                }
+                (true, false) => {
+                    return Ok(LeafCreation::CatalogConflict {
+                        leaf_name: leaf.leaf_name().to_owned(),
+                        kind: CatalogConflictKind::PhysicalNonconformant,
+                        detail: "cataloged heartbeat index name belongs to another relation"
+                            .to_owned(),
+                    });
+                }
             }
             sqlx::query(&format!(
                 "CREATE INDEX {} ON {} (task_id, role, sent_at DESC)",
@@ -381,12 +402,15 @@ async fn heartbeat_leaf_is_conformant(
         leaf.leaf_name(),
         HEARTBEATS_TABLE,
         &catalog.id_index_name,
+        leaf.bounds(),
+        LeafIndexKind::Heartbeat,
     )
     .await?;
     Ok(physical.relation_exists
-        && physical.id_index_exists
+        && physical.id_index_conformant
         && physical.detach_pending == Some(false)
-        && physical.partition_bound.as_deref() == Some(catalog.partition_bound.as_str()))
+        && physical.partition_bound.as_deref() == Some(catalog.partition_bound.as_str())
+        && physical.partition_bound_matches_expected)
 }
 
 pub async fn ensure_heartbeat_coverage(

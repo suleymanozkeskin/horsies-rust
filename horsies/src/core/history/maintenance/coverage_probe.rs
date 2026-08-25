@@ -344,7 +344,71 @@ leaf_state AS (
         AND attachment.inhrelid IS NOT NULL
         AND NOT attachment.inhdetachpending
         AND pg_get_expr(leaf.relpartbound, leaf.oid) = catalog.partition_bound
-        AND id_index.indexrelid IS NOT NULL
+        AND pg_get_expr(leaf.relpartbound, leaf.oid) = format(
+            'FOR VALUES FROM (%L) TO (%L)',
+            desired.lower_anchor,
+            desired.upper_anchor
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM pg_index AS id_index
+            JOIN pg_class AS id_relation
+              ON id_relation.oid = id_index.indexrelid
+            JOIN pg_am AS id_method
+              ON id_method.oid = id_relation.relam
+            WHERE id_index.indexrelid = to_regclass(catalog.id_index_name)
+              AND id_index.indrelid = leaf.oid
+              AND id_method.amname = 'btree'
+              AND id_index.indisvalid
+              AND id_index.indisready
+              AND id_index.indislive
+              AND NOT id_index.indisunique
+              AND NOT id_index.indisprimary
+              AND NOT id_index.indisexclusion
+              AND id_index.indpred IS NULL
+              AND id_index.indexprs IS NULL
+              AND (
+                  (
+                      desired.leaf_kind = 'history'
+                      AND id_index.indnkeyatts = 1
+                      AND id_index.indnatts = 1
+                      AND id_index.indkey[0] = (
+                          SELECT attribute.attnum
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'task_id'
+                      )
+                      AND id_index.indoption[0] = 0
+                  )
+                  OR
+                  (
+                      desired.leaf_kind = 'heartbeat'
+                      AND id_index.indnkeyatts = 3
+                      AND id_index.indnatts = 3
+                      AND id_index.indkey[0] = (
+                          SELECT attribute.attnum
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'task_id'
+                      )
+                      AND id_index.indkey[1] = (
+                          SELECT attribute.attnum
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'role'
+                      )
+                      AND id_index.indkey[2] = (
+                          SELECT attribute.attnum
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'sent_at'
+                      )
+                      AND id_index.indoption[0] = 0
+                      AND id_index.indoption[1] = 0
+                      AND id_index.indoption[2] = 3
+                  )
+              )
+        )
         AND (
             desired.leaf_kind = 'heartbeat'
             OR EXISTS (
@@ -356,14 +420,23 @@ leaf_state AS (
                   ON ordering_method.oid = ordering_relation.relam
                 WHERE ordering_index.indrelid = leaf.oid
                   AND ordering_method.amname = 'btree'
+                  AND ordering_index.indisvalid
+                  AND ordering_index.indisready
+                  AND ordering_index.indislive
+                  AND NOT ordering_index.indisunique
+                  AND NOT ordering_index.indisprimary
+                  AND NOT ordering_index.indisexclusion
                   AND ordering_index.indpred IS NULL
+                  AND ordering_index.indexprs IS NULL
                   AND ordering_index.indnkeyatts = 1
+                  AND ordering_index.indnatts = 1
                   AND ordering_index.indkey[0] = (
                       SELECT attribute.attnum
                       FROM pg_attribute AS attribute
                       WHERE attribute.attrelid = leaf.oid
                         AND attribute.attname = 'enqueued_at'
                   )
+                  AND ordering_index.indoption[0] = 0
             )
         ) AS leaf_conformant
     FROM named_desired AS desired
@@ -374,9 +447,6 @@ leaf_state AS (
     LEFT JOIN pg_inherits AS attachment
       ON attachment.inhparent = to_regclass(desired.parent_name)
      AND attachment.inhrelid = leaf.oid
-    LEFT JOIN pg_index AS id_index
-      ON id_index.indexrelid = to_regclass(catalog.id_index_name)
-     AND id_index.indrelid = leaf.oid
 ),
 summary AS (
     SELECT

@@ -14,18 +14,20 @@ use crate::core::history::commands::{
 };
 use crate::core::history::ddl::classes::FOREVER_CLASS_KEY;
 use crate::core::history::ddl::runtime_names::{
-    daily_leaf_name, leaf_id_index_name, render_daily_leaf_ddl, render_leaf_enqueued_index_ddl,
-    render_leaf_id_index_ddl,
+    daily_leaf_name, leaf_enqueued_index_name, leaf_id_index_name, render_daily_leaf_ddl,
+    render_leaf_enqueued_index_ddl, render_leaf_id_index_ddl,
 };
 use crate::core::history::errors::HistoryError;
-use crate::core::history::names::{LEAF_CATALOG, TASK_HISTORY_FOREVER, WORKFLOW_PHASE2_PENDING};
+use crate::core::history::names::{
+    HEARTBEAT_CLASS_KEY, LEAF_CATALOG, TASK_HISTORY_FOREVER, WORKFLOW_PHASE2_PENDING,
+};
 use crate::core::history::outcomes::{
     CatalogConflictKind, LeafAttachment, LeafCreation, LeafDrop, LeafInspection,
 };
 
 use super::catalog::{
     capture_partition_bound_utc, database_now, read_leaf_catalog_row,
-    read_leaf_ordering_index_exists, read_leaf_physical_state, read_retention_class,
+    read_leaf_ordering_index_exists, read_leaf_physical_state, read_retention_class, LeafIndexKind,
     RetentionClassRow, INDEX_SCHEMA_VERSION,
 };
 use super::locks::{
@@ -195,8 +197,18 @@ pub async fn inspect_leaf(
         || leaf_id_index_name(leaf.leaf_name()),
         |row| row.id_index_name.clone(),
     );
-    let physical =
-        read_leaf_physical_state(connection, leaf.leaf_name(), parent_name, &id_index_name).await?;
+    let physical = read_leaf_physical_state(
+        connection,
+        leaf.leaf_name(),
+        parent_name,
+        &id_index_name,
+        leaf.bounds(),
+        match leaf.class_key() {
+            HEARTBEAT_CLASS_KEY => LeafIndexKind::Heartbeat,
+            _ => LeafIndexKind::History,
+        },
+    )
+    .await?;
     let expires_at = leaf.bounds().upper() + duration;
 
     let Some(catalog) = catalog else {
@@ -245,7 +257,8 @@ pub async fn inspect_leaf(
     }
     if physical.detach_pending.is_some()
         && (physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str())
-            || !physical.id_index_exists)
+            || !physical.partition_bound_matches_expected
+            || !physical.id_index_conformant)
     {
         return Ok(LeafInspection::CatalogConflict {
             leaf_name: leaf.leaf_name().to_owned(),
@@ -295,6 +308,42 @@ pub async fn inspect_leaf(
     }
 }
 
+enum IndexRelationState {
+    Absent,
+    Attached,
+    Foreign,
+}
+
+async fn index_relation_state(
+    connection: &mut PgConnection,
+    leaf_name: &str,
+    index_name: &str,
+) -> Result<IndexRelationState, HistoryError> {
+    let state: String = sqlx::query_scalar(
+        "SELECT CASE
+             WHEN to_regclass($2) IS NULL THEN 'absent'
+             WHEN EXISTS (
+                 SELECT 1 FROM pg_index
+                 WHERE indexrelid = to_regclass($2)
+                   AND indrelid = to_regclass($1)
+             ) THEN 'attached'
+             ELSE 'foreign'
+         END",
+    )
+    .bind(leaf_name)
+    .bind(index_name)
+    .fetch_one(connection)
+    .await?;
+    match state.as_str() {
+        "absent" => Ok(IndexRelationState::Absent),
+        "attached" => Ok(IndexRelationState::Attached),
+        "foreign" => Ok(IndexRelationState::Foreign),
+        _ => Err(HistoryError::contract(
+            "index relation probe returned an unknown state",
+        )),
+    }
+}
+
 pub async fn create_daily_leaf<P: LoaderPublication>(
     connection: &mut PgConnection,
     command: &CreateDailyHistoryLeaf,
@@ -338,9 +387,15 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
         || leaf_id_index_name(leaf.leaf_name()),
         |row| row.id_index_name.clone(),
     );
-    let physical =
-        read_leaf_physical_state(connection, leaf.leaf_name(), &parent_name, &id_index_name)
-            .await?;
+    let physical = read_leaf_physical_state(
+        connection,
+        leaf.leaf_name(),
+        &parent_name,
+        &id_index_name,
+        leaf.bounds(),
+        LeafIndexKind::History,
+    )
+    .await?;
     if physical.relation_exists != catalog.is_some() {
         let detail = if physical.relation_exists {
             "relation exists without a catalog row"
@@ -367,11 +422,14 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
                 detail: "existing leaf metadata differs from the request".to_owned(),
             });
         }
-        if physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str()) {
+        if physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str())
+            || !physical.partition_bound_matches_expected
+        {
             return Ok(LeafCreation::CatalogConflict {
                 leaf_name: leaf.leaf_name().to_owned(),
                 kind: CatalogConflictKind::PhysicalNonconformant,
-                detail: "attached leaf partition bound differs from catalog".to_owned(),
+                detail: "attached leaf partition bound differs from catalog or requested bounds"
+                    .to_owned(),
             });
         }
         if physical.detach_pending != Some(false) {
@@ -382,7 +440,7 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
             });
         }
         let ordering = read_leaf_ordering_index_exists(connection, leaf.leaf_name()).await?;
-        if !physical.id_index_exists || !ordering {
+        if !physical.id_index_conformant || !ordering {
             if matches!(
                 try_lock_relation_exclusive_for_transaction(connection, leaf.leaf_name()).await?,
                 LeafLockAttempt::Busy
@@ -391,12 +449,49 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
                     leaf_name: leaf.leaf_name().to_owned(),
                 });
             }
-            if !physical.id_index_exists {
-                sqlx::query(&render_leaf_id_index_ddl(leaf.leaf_name())?)
-                    .execute(&mut *connection)
-                    .await?;
+            if !physical.id_index_conformant {
+                match (physical.id_index_relation_exists, physical.id_index_exists) {
+                    (false, _) => {}
+                    (true, true) => {
+                        sqlx::query(&format!("DROP INDEX {}", catalog.id_index_name))
+                            .execute(&mut *connection)
+                            .await?;
+                    }
+                    (true, false) => {
+                        return Ok(LeafCreation::CatalogConflict {
+                            leaf_name: leaf.leaf_name().to_owned(),
+                            kind: CatalogConflictKind::PhysicalNonconformant,
+                            detail: "cataloged task-ID index name belongs to another relation"
+                                .to_owned(),
+                        });
+                    }
+                }
+                sqlx::query(&format!(
+                    "CREATE INDEX {} ON {} (task_id)",
+                    catalog.id_index_name,
+                    leaf.leaf_name()
+                ))
+                .execute(&mut *connection)
+                .await?;
             }
             if !ordering {
+                let ordering_name = leaf_enqueued_index_name(leaf.leaf_name());
+                match index_relation_state(connection, leaf.leaf_name(), &ordering_name).await? {
+                    IndexRelationState::Absent => {}
+                    IndexRelationState::Attached => {
+                        sqlx::query(&format!("DROP INDEX {ordering_name}"))
+                            .execute(&mut *connection)
+                            .await?;
+                    }
+                    IndexRelationState::Foreign => {
+                        return Ok(LeafCreation::CatalogConflict {
+                            leaf_name: leaf.leaf_name().to_owned(),
+                            kind: CatalogConflictKind::PhysicalNonconformant,
+                            detail: "derived ordering-index name belongs to another relation"
+                                .to_owned(),
+                        });
+                    }
+                }
                 sqlx::query(&render_leaf_enqueued_index_ddl(leaf.leaf_name())?)
                     .execute(&mut *connection)
                     .await?;
@@ -485,12 +580,15 @@ async fn daily_leaf_is_conformant(
         leaf.leaf_name(),
         parent_name,
         &catalog.id_index_name,
+        leaf.bounds(),
+        LeafIndexKind::History,
     )
     .await?;
     if !physical.relation_exists
-        || !physical.id_index_exists
+        || !physical.id_index_conformant
         || physical.detach_pending != Some(false)
         || physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str())
+        || !physical.partition_bound_matches_expected
     {
         return Ok(false);
     }

@@ -22,7 +22,7 @@ use crate::core::history::ddl::classes::{
     finite_class_parent_name, register_finite_retention_class, ClassRegistration,
 };
 use crate::core::history::ddl::runtime_names::{
-    daily_leaf_name, leaf_enqueued_index_name, leaf_id_index_name,
+    daily_leaf_name, leaf_enqueued_index_name, leaf_id_index_name, render_daily_leaf_ddl,
 };
 use crate::core::history::heartbeats::partitioning::{
     create_hourly_heartbeat_leaf, ensure_heartbeat_coverage, heartbeat_horizon, hourly_leaf_name,
@@ -40,15 +40,15 @@ use crate::core::history::maintenance::gate::{
 };
 use crate::core::history::maintenance::pruning::prune_expired_partitions;
 use crate::core::history::names::{
-    LEAF_CATALOG, LEAF_LOCK_KEY_FUNCTION, RETENTION_CLASSES, TASK_HISTORY_FOREVER,
-    TASK_HISTORY_PARENT,
+    HEARTBEATS_TABLE, HEARTBEAT_CLASS_KEY, LEAF_CATALOG, LEAF_LOCK_KEY_FUNCTION, RETENTION_CLASSES,
+    TASK_HISTORY_FOREVER, TASK_HISTORY_PARENT, TASK_LOOKUP_MANIFEST,
 };
 use crate::core::history::outcomes::{HealthFault, LeafCreation, LeafDrop, LeafInspection};
 use crate::core::history::reads::publisher::StagedLoaderPublisher;
 
 use super::catalog::{
     capture_partition_bound_utc, database_now, read_attached_birth_floor, read_leaf_catalog_row,
-    read_leaf_physical_state, read_manifest_leaf_rows,
+    read_leaf_physical_state, read_manifest_leaf_rows, LeafIndexKind,
 };
 use super::forever::{ensure_forever_range_partitioning, FOREVER_LEGACY_LEAF};
 use super::health::collect_partition_health;
@@ -120,6 +120,11 @@ struct FailFirstRepublish {
     reference_calls: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+struct FailFirstStagedPublisher {
+    calls: AtomicUsize,
+}
+
 #[derive(Debug)]
 struct BlockingPublisher {
     entered: Arc<Notify>,
@@ -168,6 +173,37 @@ impl LoaderPublication for FailFirstRepublish {
         _leaf_name: &str,
     ) -> Result<bool, crate::core::history::errors::HistoryError> {
         Ok(self.reference_calls.fetch_add(1, Ordering::SeqCst) == 0)
+    }
+}
+
+impl LoaderPublication for FailFirstStagedPublisher {
+    async fn republish(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<LoaderRepublished, crate::core::history::errors::HistoryError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(crate::core::history::errors::HistoryError::contract(
+                "injected post-commit publication failure",
+            ));
+        }
+        StagedLoaderPublisher.republish(connection).await
+    }
+
+    async fn references_leaf(
+        &self,
+        connection: &mut PgConnection,
+        leaf_name: &str,
+    ) -> Result<bool, crate::core::history::errors::HistoryError> {
+        StagedLoaderPublisher
+            .references_leaf(connection, leaf_name)
+            .await
+    }
+
+    async fn needs_republication(
+        &self,
+        connection: &mut PgConnection,
+    ) -> Result<bool, crate::core::history::errors::HistoryError> {
+        StagedLoaderPublisher.needs_republication(connection).await
     }
 }
 
@@ -1140,6 +1176,247 @@ async fn healthy_pool_coverage_has_a_fixed_statement_budget() {
 
 #[tokio::test]
 #[serial]
+async fn failed_post_commit_publication_is_retried_by_the_next_healthy_pass() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let setup =
+        ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &StagedLoaderPublisher)
+            .await
+            .expect("create and publish initial coverage");
+    assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+
+    let publisher = FailFirstStagedPublisher::default();
+    let error = ensure_partition_coverage_in_pool(&database.pool, 3, 3, &[], &publisher)
+        .await
+        .expect_err("inject final publication failure");
+    assert!(error
+        .to_string()
+        .contains("injected post-commit publication failure"));
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 1);
+
+    let unpublished: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)
+         FROM {LEAF_CATALOG} AS catalog
+         WHERE catalog.detached_at IS NULL
+           AND catalog.dropped_at IS NULL
+           AND catalog.class_key <> $1
+           AND to_regclass(catalog.leaf_name) IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM {TASK_LOOKUP_MANIFEST} AS manifest
+               WHERE manifest.leaf_name = catalog.leaf_name
+           )"
+    ))
+    .bind(HEARTBEAT_CLASS_KEY)
+    .fetch_one(&database.pool)
+    .await
+    .expect("count committed unpublished leaves");
+    assert!(unpublished > 0);
+
+    let retry = ensure_partition_coverage_in_pool(&database.pool, 3, 3, &[], &publisher)
+        .await
+        .expect("retry publication on a healthy coverage pass");
+    let CoverageOutcome::Ensured(retry) = retry else {
+        panic!("the next healthy pass must publish the committed leaves");
+    };
+    assert!(retry.republished);
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 2);
+    let unpublished: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)
+         FROM {LEAF_CATALOG} AS catalog
+         WHERE catalog.detached_at IS NULL
+           AND catalog.dropped_at IS NULL
+           AND catalog.class_key <> $1
+           AND to_regclass(catalog.leaf_name) IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM {TASK_LOOKUP_MANIFEST} AS manifest
+               WHERE manifest.leaf_name = catalog.leaf_name
+           )"
+    ))
+    .bind(HEARTBEAT_CLASS_KEY)
+    .fetch_one(&database.pool)
+    .await
+    .expect("verify all attached leaves are published");
+    assert_eq!(unpublished, 0);
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn current_heartbeat_with_a_wrong_physical_range_refuses_startup() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let setup = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("create heartbeat coverage");
+    assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+
+    let (leaf_name, index_name, lower_anchor, upper_anchor): (
+        String,
+        String,
+        chrono::DateTime<Utc>,
+        chrono::DateTime<Utc>,
+    ) = sqlx::query_as(&format!(
+        "SELECT leaf_name, id_index_name, lower_anchor, upper_anchor
+         FROM {LEAF_CATALOG}
+         WHERE class_key = $1
+           AND lower_anchor <= statement_timestamp()
+           AND upper_anchor > statement_timestamp()
+           AND detached_at IS NULL
+           AND dropped_at IS NULL"
+    ))
+    .bind(HEARTBEAT_CLASS_KEY)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read current heartbeat leaf");
+    sqlx::query(&format!(
+        "ALTER TABLE {HEARTBEATS_TABLE} DETACH PARTITION {leaf_name}"
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("detach current heartbeat leaf");
+    sqlx::query(&format!("DROP TABLE {leaf_name}"))
+        .execute(&database.pool)
+        .await
+        .expect("drop current heartbeat leaf");
+    let wrong_bounds = LeafBounds::new(
+        lower_anchor - Duration::days(100),
+        upper_anchor - Duration::days(100),
+    )
+    .expect("valid wrong heartbeat bounds");
+    let wrong_leaf = LeafRef::new(&leaf_name, HEARTBEAT_CLASS_KEY, wrong_bounds)
+        .expect("wrong-range heartbeat leaf");
+    sqlx::query(
+        &render_daily_leaf_ddl(HEARTBEATS_TABLE, &wrong_leaf)
+            .expect("render wrong-range heartbeat leaf"),
+    )
+    .execute(&database.pool)
+    .await
+    .expect("create wrong-range heartbeat leaf");
+    sqlx::query(&format!(
+        "CREATE INDEX {index_name} ON {leaf_name} (task_id, role, sent_at DESC)"
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("create conformant heartbeat index on wrong range");
+    let mut connection = database.pool.acquire().await.expect("acquire bound reader");
+    let wrong_bound = capture_partition_bound_utc(&mut connection, &leaf_name)
+        .await
+        .expect("capture wrong physical bound")
+        .expect("wrong physical bound exists");
+    drop(connection);
+    sqlx::query(&format!(
+        "UPDATE {LEAF_CATALOG} SET partition_bound = $1 WHERE leaf_name = $2"
+    ))
+    .bind(wrong_bound)
+    .bind(&leaf_name)
+    .execute(&database.pool)
+    .await
+    .expect("make stored bound match the wrong physical bound");
+
+    let startup = ensure_startup_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("validate startup with a wrong current heartbeat range");
+    let StartupCoverageOutcome::Refused(CoverageOutcome::Failed(failure)) = startup else {
+        panic!("a wrong current-heartbeat range must refuse startup");
+    };
+    assert!(!failure.heartbeat_covered_now);
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coverage_repairs_same_name_wrong_shape_and_invalid_indexes() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let setup = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("create index-repair coverage");
+    assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+
+    let heartbeat = sqlx::query_as::<_, super::catalog::LeafCatalogRow>(&format!(
+        "SELECT leaf_name, parent_name, class_key, lower_anchor, upper_anchor,
+                index_schema_version, id_index_name, partition_bound, min_birth_at,
+                min_birth_verified, created_at, detached_at, dropped_at
+         FROM {LEAF_CATALOG}
+         WHERE class_key = $1
+           AND lower_anchor <= statement_timestamp()
+           AND upper_anchor > statement_timestamp()"
+    ))
+    .bind(HEARTBEAT_CLASS_KEY)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read current heartbeat catalog row");
+    sqlx::query(&format!("DROP INDEX {}", heartbeat.id_index_name))
+        .execute(&database.pool)
+        .await
+        .expect("drop heartbeat index");
+    sqlx::query(&format!(
+        "CREATE INDEX {} ON {} (task_id, role, sent_at ASC)",
+        heartbeat.id_index_name, heartbeat.leaf_name
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("create same-name heartbeat index with wrong sort direction");
+
+    let history = sqlx::query_as::<_, super::catalog::LeafCatalogRow>(&format!(
+        "SELECT leaf_name, parent_name, class_key, lower_anchor, upper_anchor,
+                index_schema_version, id_index_name, partition_bound, min_birth_at,
+                min_birth_verified, created_at, detached_at, dropped_at
+         FROM {LEAF_CATALOG}
+         WHERE class_key <> $1
+           AND detached_at IS NULL
+           AND dropped_at IS NULL
+         ORDER BY lower_anchor, leaf_name
+         LIMIT 1"
+    ))
+    .bind(HEARTBEAT_CLASS_KEY)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read history catalog row");
+    sqlx::query("UPDATE pg_index SET indisvalid = false WHERE indexrelid = to_regclass($1)")
+        .bind(&history.id_index_name)
+        .execute(&database.pool)
+        .await
+        .expect("mark history index invalid");
+
+    let outcome = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("repair malformed indexes");
+    assert!(matches!(outcome, CoverageOutcome::Ensured(_)));
+    let heartbeat_bounds =
+        LeafBounds::new(heartbeat.lower_anchor, heartbeat.upper_anchor).expect("heartbeat bounds");
+    let history_bounds =
+        LeafBounds::new(history.lower_anchor, history.upper_anchor).expect("history bounds");
+    let mut connection = database.pool.acquire().await.expect("acquire index reader");
+    assert!(
+        read_leaf_physical_state(
+            &mut connection,
+            &heartbeat.leaf_name,
+            &heartbeat.parent_name,
+            &heartbeat.id_index_name,
+            &heartbeat_bounds,
+            LeafIndexKind::Heartbeat,
+        )
+        .await
+        .expect("read repaired heartbeat index")
+        .id_index_conformant
+    );
+    assert!(
+        read_leaf_physical_state(
+            &mut connection,
+            &history.leaf_name,
+            &history.parent_name,
+            &history.id_index_name,
+            &history_bounds,
+            LeafIndexKind::History,
+        )
+        .await
+        .expect("read repaired history index")
+        .id_index_conformant
+    );
+    drop(connection);
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn pool_coverage_repairs_only_the_damaged_leaf_in_one_mutation_transaction() {
     let database = TestDatabase::create_with_connections(4).await;
     let setup = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
@@ -2065,10 +2342,13 @@ async fn populated_v34_forever_leaf_converts_without_rewriting_old_rows() {
             FOREVER_LEGACY_LEAF,
             TASK_HISTORY_FOREVER,
             &legacy.id_index_name,
+            &LeafBounds::new(legacy.lower_anchor, legacy.upper_anchor)
+                .expect("valid legacy bounds"),
+            LeafIndexKind::History,
         )
         .await
         .expect("read legacy physical state")
-        .id_index_exists
+        .id_index_conformant
     );
     assert_eq!(
         capture_partition_bound_utc(&mut transaction, FOREVER_LEGACY_LEAF)
