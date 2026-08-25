@@ -56,6 +56,27 @@ fn uuid(value: &str) -> Uuid {
     Uuid::parse_str(value).expect("test identity must be UUID")
 }
 
+fn plan_has_sequential_scan(plan: &serde_json::Value, relation: &str) -> bool {
+    match plan {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| plan_has_sequential_scan(value, relation)),
+        serde_json::Value::Object(fields) => {
+            let is_target_scan = fields.get("Node Type").and_then(serde_json::Value::as_str)
+                == Some("Seq Scan")
+                && fields
+                    .get("Relation Name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(relation);
+            is_target_scan
+                || fields
+                    .values()
+                    .any(|value| plan_has_sequential_scan(value, relation))
+        }
+        _ => false,
+    }
+}
+
 fn test_db_url() -> String {
     if let Ok(url) = std::env::var("DATABASE_URL") {
         return url;
@@ -1664,8 +1685,15 @@ async fn cancel_owned_orphan_applies_only_without_runnable_linkage() {
 }
 
 async fn drain_orphan_sweep(pool: &PgPool) {
-    loop {
-        let drained = terminalize(
+    let initial_cycles: i64 = sqlx::query_scalar(
+        "SELECT completed_cycles FROM horsies_recovery_scan_cursors
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read orphan audit cycle");
+    for _ in 0..10_000 {
+        terminalize(
             pool,
             &TerminalizationCommand::CancelOrphanedTasks {
                 batch_size: BatchSize::new(500).unwrap(),
@@ -1673,10 +1701,19 @@ async fn drain_orphan_sweep(pool: &PgPool) {
         )
         .await
         .expect("drain");
-        if drained.len() < 500 {
-            break;
+        let (completed_cycles, scanned): (i64, i32) = sqlx::query_as(
+            "SELECT completed_cycles, last_scan_rows
+             FROM horsies_recovery_scan_cursors
+             WHERE scan_name = 'orphan_workflow_tasks'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read orphan audit progress");
+        if scanned == 0 || completed_cycles > initial_cycles {
+            return;
         }
     }
+    panic!("orphan audit did not complete one cursor cycle");
 }
 
 #[tokio::test]
@@ -1736,6 +1773,290 @@ async fn orphan_sweep_cancels_unlinked_and_retains_linked() {
 
     cleanup(&pool, &[&orphan, &linked]).await;
     cleanup_workflow(&pool, &wf_id).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
+    let pool = migrated_pool().await;
+    let workflow_id = Uuid::parse_str("30000000-0000-7000-8000-000000000001").unwrap();
+    let orphan_id = Uuid::parse_str("40000000-0000-7000-8000-00000000c351").unwrap();
+    sqlx::query("DELETE FROM horsies_workflow_tasks WHERE workflow_id = $1")
+        .bind(workflow_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM horsies_workflows WHERE id = $1")
+        .bind(workflow_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM horsies_tasks WHERE task_name = 'bounded_recovery_cursor_task'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM horsies_task_history WHERE task_id = $1")
+        .bind(orphan_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE horsies_recovery_scan_cursors
+         SET last_id = NULL, completed_cycles = 0,
+             last_scan_rows = 0, last_candidate_rows = 0,
+             last_scan_at = NULL
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO horsies_workflows (
+             id, name, status, on_error, output_task_index,
+             definition_key, depth, root_workflow_id,
+             sent_at, created_at, started_at, updated_at
+         ) VALUES (
+             $1, 'bounded_recovery_cursor_workflow', 'RUNNING', 'fail', NULL,
+             'test.bounded-recovery.cursor.v1', 0, $1,
+             NOW(), NOW(), NOW(), NOW()
+         )",
+    )
+    .bind(workflow_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH generated AS (
+             SELECT g,
+                    ('40000000-0000-7000-8000-' ||
+                     lpad(to_hex(g), 12, '0'))::uuid AS task_id
+             FROM generate_series(1, 50001) AS g
+         )
+         INSERT INTO horsies_tasks (
+             id, task_name, queue_name, priority, args, kwargs, status,
+             sent_at, enqueued_at, claimed, is_workflow_task,
+             retry_count, max_retries, enqueue_sha,
+             command_fingerprint_version, command_fingerprint,
+             retention_class_key, retain_rerun_input,
+             prepared_rerun_input_disposition, created_at, updated_at
+         )
+         SELECT task_id, 'bounded_recovery_cursor_task', 'default', 100, '[]', '{}',
+                'PENDING', NOW(), NOW(), FALSE, TRUE,
+                0, 3, task_id::text, 1, decode(repeat('07', 32), 'hex'),
+                'forever', TRUE, 'DECLINED_BY_POLICY', NOW(), NOW()
+         FROM generated",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "WITH generated AS (
+             SELECT g,
+                    ('40000000-0000-7000-8000-' ||
+                     lpad(to_hex(g), 12, '0'))::uuid AS task_id,
+                    ('50000000-0000-7000-8000-' ||
+                     lpad(to_hex(g), 12, '0'))::uuid AS node_row_id
+             FROM generate_series(1, 50000) AS g
+         )
+         INSERT INTO horsies_workflow_tasks (
+             id, workflow_id, task_index, node_id, task_name,
+             queue_name, priority, dependencies, allow_failed_deps,
+             join_type, status, is_subworkflow, task_id, created_at
+         )
+         SELECT node_row_id, $1, g, 'node_' || g, 'bounded_recovery_cursor_task',
+                'default', 100, '{}'::integer[], FALSE,
+                'all', 'PENDING', FALSE, task_id, NOW()
+         FROM generated",
+    )
+    .bind(workflow_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE horsies_tasks, horsies_workflow_tasks")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let command = TerminalizationCommand::CancelOrphanedTasks {
+        batch_size: BatchSize::new(500).unwrap(),
+    };
+    let first = terminalize(&pool, &command).await.unwrap();
+    assert!(first.is_empty());
+    let first_stats: (i32, i32) = sqlx::query_as(
+        "SELECT last_scan_rows, last_candidate_rows
+         FROM horsies_recovery_scan_cursors
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first_stats, (500, 0));
+
+    let plan: serde_json::Value = sqlx::query_scalar(
+        "EXPLAIN (FORMAT JSON)
+         WITH scanned AS MATERIALIZED (
+             SELECT id FROM horsies_tasks
+             WHERE is_workflow_task = TRUE
+               AND status IN ('CLAIMED', 'PENDING')
+             ORDER BY id LIMIT 500
+         )
+         SELECT candidate.id
+         FROM scanned s
+         CROSS JOIN LATERAL (
+             SELECT t.id
+             FROM horsies_tasks t
+             LEFT JOIN LATERAL (
+                 SELECT TRUE AS found
+                 FROM horsies_workflow_tasks wt
+                 WHERE wt.task_id = t.id
+                   AND wt.status IN ('ENQUEUED', 'READY', 'PENDING', 'RUNNING')
+                 LIMIT 1
+             ) runnable_link ON TRUE
+             WHERE t.id = s.id
+               AND t.is_workflow_task = TRUE
+               AND t.status IN ('CLAIMED', 'PENDING')
+               AND runnable_link.found IS NULL
+             LIMIT 1
+             FOR UPDATE OF t SKIP LOCKED
+         ) candidate",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        plan.to_string()
+            .contains("idx_horsies_tasks_orphan_recovery_scan"),
+        "orphan audit must use the partial scan index: {plan}",
+    );
+    assert!(
+        plan.to_string().contains("idx_horsies_workflow_tasks_task"),
+        "orphan audit must use workflow-task index probes: {plan}",
+    );
+    assert!(
+        !plan_has_sequential_scan(&plan, "horsies_tasks")
+            && !plan_has_sequential_scan(&plan, "horsies_workflow_tasks"),
+        "orphan audit must not scan complete task tables: {plan}",
+    );
+
+    let mut found = false;
+    for _ in 0..100 {
+        let outcomes = terminalize(&pool, &command).await.unwrap();
+        if outcomes
+            .iter()
+            .any(|outcome| outcome.task_id() == orphan_id)
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "the cyclic audit must reach the final orphan");
+    let linked_live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM horsies_tasks
+         WHERE task_name = 'bounded_recovery_cursor_task'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(linked_live, 50_000);
+
+    sqlx::query("DELETE FROM horsies_workflow_tasks WHERE workflow_id = $1")
+        .bind(workflow_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM horsies_workflows WHERE id = $1")
+        .bind(workflow_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM horsies_tasks WHERE task_name = 'bounded_recovery_cursor_task'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM horsies_task_history WHERE task_id = $1")
+        .bind(orphan_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn orphan_sweep_rollback_keeps_the_candidate_for_the_next_audit() {
+    let pool = migrated_pool().await;
+    let task_id = "00000000-0000-7000-8000-000000000001";
+    cleanup(&pool, &[task_id]).await;
+    sqlx::query(
+        "UPDATE horsies_recovery_scan_cursors
+         SET last_id = NULL, completed_cycles = 0,
+             last_scan_rows = 0, last_candidate_rows = 0,
+             last_scan_at = NULL
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_task(
+        &pool,
+        task_id,
+        Seed {
+            status: "PENDING",
+            is_workflow_task: true,
+            ..Seed::default()
+        },
+    )
+    .await;
+    let command = TerminalizationCommand::CancelOrphanedTasks {
+        batch_size: BatchSize::new(500).unwrap(),
+    };
+
+    let mut interrupted = pool.begin().await.unwrap();
+    let first = crate::broker::terminalization::terminalize_in_tx(&mut interrupted, &command)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    interrupted.rollback().await.unwrap();
+    let status: String = sqlx::query_scalar("SELECT status FROM horsies_tasks WHERE id = $1")
+        .bind(uuid(task_id))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "PENDING");
+
+    let retried = terminalize(&pool, &command).await.unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].task_id(), uuid(task_id));
+    assert_eq!(post_image(&pool, task_id).await.status, "CANCELLED");
+    cleanup(&pool, &[task_id]).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn orphan_sweep_cursor_lock_refuses_a_concurrent_audit() {
+    let pool = migrated_pool().await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT last_id FROM horsies_recovery_scan_cursors
+         WHERE scan_name = 'orphan_workflow_tasks' FOR UPDATE",
+    )
+    .execute(holder.as_mut())
+    .await
+    .unwrap();
+    let command = TerminalizationCommand::CancelOrphanedTasks {
+        batch_size: BatchSize::new(500).unwrap(),
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        terminalize(&pool, &command),
+    )
+    .await
+    .expect("concurrent orphan audit must not wait")
+    .expect_err("concurrent orphan audit must be refused");
+    assert!(
+        error.is_retryable(),
+        "lock refusal must be retryable: {error}"
+    );
+    holder.rollback().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------

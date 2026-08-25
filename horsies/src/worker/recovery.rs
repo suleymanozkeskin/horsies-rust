@@ -822,6 +822,7 @@ const RETENTION_PASS_TIME_BUDGET: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ReaperHealthSnapshot {
     pub workflow_recovery: Option<serde_json::Value>,
+    pub orphan_task_recovery: Option<serde_json::Value>,
     pub partition_coverage: Option<serde_json::Value>,
     pub partition_pruning: Option<serde_json::Value>,
     pub phase2_recovery: Option<serde_json::Value>,
@@ -859,6 +860,7 @@ pub fn spawn_reaper(
             auto_requeue_claimed = config.auto_requeue_stale_claimed,
             auto_fail_running = config.auto_fail_stale_running,
             check_interval_ms = config.check_interval_ms,
+            orphan_task_audit_interval_ms = config.orphan_task_audit_interval_ms,
             "reaper started",
         );
 
@@ -1027,41 +1029,72 @@ async fn run_reaper_pass(
     // otherwise stay CLAIMED forever; cancelling frees claim budget and lets
     // retention sweep them.
     if config.auto_terminate_orphaned_workflow_tasks && !orphan_state.disabled {
-        match terminate_orphaned_workflow_tasks(runtime_pool).await {
-            Ok(count) => {
-                orphan_state.permanent_failures = 0;
-                if count > 0 {
-                    tracing::warn!(
-                        count,
-                        "reaper cancelled orphaned workflow task(s) (no live \
+        let now = tokio::time::Instant::now();
+        if orphan_state.schedule_if_due(
+            now,
+            Duration::from_millis(config.orphan_task_audit_interval_ms),
+        ) {
+            let started = std::time::Instant::now();
+            match terminate_orphaned_workflow_tasks(runtime_pool, started).await {
+                Ok(report) => {
+                    orphan_state.permanent_failures = 0;
+                    if report.cancelled > 0 {
+                        tracing::warn!(
+                            count = report.cancelled,
+                            "reaper cancelled orphaned workflow task(s) (no live \
                          workflow_task linkage)",
+                        );
+                    }
+                    health.write().await.orphan_task_recovery = Some(
+                        serde_json::to_value(report).unwrap_or_else(|error| {
+                            serde_json::json!({"state": "error", "error": error.to_string()})
+                        }),
                     );
                 }
-            }
-            Err(e) if e.is_retryable() => {
-                orphan_state.permanent_failures = 0;
-                tracing::warn!(
-                    error = %e,
-                    "reaper orphan sweep transient failure (will retry next cycle)",
-                );
-            }
-            Err(e) => {
-                orphan_state.permanent_failures += 1;
-                if orphan_state.permanent_failures >= ORPHAN_SWEEP_MAX_PERMANENT_FAILURES {
-                    orphan_state.disabled = true;
-                    tracing::error!(
+                Err(e) if e.is_retryable() => {
+                    orphan_state.permanent_failures = 0;
+                    health.write().await.orphan_task_recovery = Some(serde_json::json!({
+                        "state": "refused",
+                        "rows_selected": 0,
+                        "candidates_returned": 0,
+                        "cancelled": 0,
+                        "duration_ms": elapsed_millis(started),
+                        "refusals": 1,
+                        "errors": 0,
+                        "error": e.to_string(),
+                    }));
+                    tracing::warn!(
                         error = %e,
-                        failures = orphan_state.permanent_failures,
-                        "reaper orphan sweep disabled after consecutive permanent \
-                         failures; requires deploy or manual intervention",
+                        "reaper orphan audit was refused and will retry on its next schedule",
                     );
-                } else {
-                    tracing::error!(
-                        error = %e,
-                        failures = orphan_state.permanent_failures,
-                        max = ORPHAN_SWEEP_MAX_PERMANENT_FAILURES,
-                        "reaper orphan sweep permanent failure",
-                    );
+                }
+                Err(e) => {
+                    orphan_state.permanent_failures += 1;
+                    health.write().await.orphan_task_recovery = Some(serde_json::json!({
+                        "state": "error",
+                        "rows_selected": 0,
+                        "candidates_returned": 0,
+                        "cancelled": 0,
+                        "duration_ms": elapsed_millis(started),
+                        "refusals": 0,
+                        "errors": 1,
+                        "error": e.to_string(),
+                    }));
+                    if orphan_state.permanent_failures >= ORPHAN_SWEEP_MAX_PERMANENT_FAILURES {
+                        orphan_state.disabled = true;
+                        tracing::error!(
+                            error = %e,
+                            failures = orphan_state.permanent_failures,
+                            "reaper orphan audit disabled after consecutive permanent failures",
+                        );
+                    } else {
+                        tracing::error!(
+                            error = %e,
+                            failures = orphan_state.permanent_failures,
+                            max = ORPHAN_SWEEP_MAX_PERMANENT_FAILURES,
+                            "reaper orphan audit failed",
+                        );
+                    }
                 }
             }
         }
@@ -1453,43 +1486,136 @@ const EXPIRE_BATCH_SIZE: i32 = 500;
 /// Max batches per reaper pass, bounding work and trigger-NOTIFY volume.
 const EXPIRE_MAX_BATCHES_PER_PASS: u32 = 200;
 
-/// Orphan-sweep bounds: same batch/pass convention as pending expiry.
+/// Maximum rows examined by one orphan-task audit page.
 const ORPHAN_BATCH_SIZE: i32 = 500;
-const ORPHAN_MAX_BATCHES_PER_PASS: u32 = 200;
 /// Consecutive permanent failures before the orphan sweep disables itself.
 const ORPHAN_SWEEP_MAX_PERMANENT_FAILURES: u32 = 3;
 
 /// Per-reaper state for the orphan sweep's disable-after-permanent-failures
 /// guard: a sweep that keeps failing non-retryably (a contract breach, not a
 /// network blip) stops burning every cycle on it.
-#[derive(Default)]
 struct OrphanSweepState {
+    next_audit: tokio::time::Instant,
     permanent_failures: u32,
     disabled: bool,
 }
 
+impl Default for OrphanSweepState {
+    fn default() -> Self {
+        Self {
+            next_audit: tokio::time::Instant::now(),
+            permanent_failures: 0,
+            disabled: false,
+        }
+    }
+}
+
+impl OrphanSweepState {
+    fn schedule_if_due(&mut self, now: tokio::time::Instant, interval: Duration) -> bool {
+        if now < self.next_audit {
+            return false;
+        }
+        self.next_audit = now + interval;
+        true
+    }
+}
+
+#[cfg(test)]
+mod orphan_audit_schedule_tests {
+    use super::*;
+
+    #[test]
+    fn orphan_task_audit_uses_its_own_interval() {
+        let now = tokio::time::Instant::now();
+        let mut state = OrphanSweepState {
+            next_audit: now,
+            permanent_failures: 0,
+            disabled: false,
+        };
+        let interval = Duration::from_secs(60);
+        assert!(state.schedule_if_due(now, interval));
+        assert!(!state.schedule_if_due(now + Duration::from_secs(59), interval));
+        assert!(state.schedule_if_due(now + Duration::from_secs(60), interval));
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OrphanTaskAuditReport {
+    state: &'static str,
+    rows_selected: u32,
+    candidates_returned: u32,
+    cancelled: u32,
+    duration_ms: u64,
+    refusals: u32,
+    errors: u32,
+}
+
+#[derive(sqlx::FromRow)]
+struct OrphanTaskScanStats {
+    rows_selected: i32,
+    candidates_returned: i32,
+}
+
+fn elapsed_millis(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Cancel orphaned workflow tasks in bounded batches.
 ///
-/// A discovery batch reports one row per transition it made, and every row
-/// of a discovery batch is APPLIED — anything else is a contract breach
-/// surfaced as an error by the adapter. Early-stops on a short batch.
+/// One call examines one cursor page. The terminalization adapter returns one
+/// APPLIED outcome per orphan candidate. Any other outcome is a contract breach.
 async fn terminate_orphaned_workflow_tasks(
     pool: &PgPool,
-) -> Result<u64, crate::broker::BrokerError> {
+    started: std::time::Instant,
+) -> Result<OrphanTaskAuditReport, crate::broker::BrokerError> {
     let command = crate::core::lifecycle::TerminalizationCommand::CancelOrphanedTasks {
         batch_size: crate::core::lifecycle::BatchSize::new(ORPHAN_BATCH_SIZE)
             .expect("ORPHAN_BATCH_SIZE is positive"),
     };
-    let mut total: u64 = 0;
-    for _ in 0..ORPHAN_MAX_BATCHES_PER_PASS {
-        let cancelled = crate::broker::terminalization::terminalize(pool, &command).await?;
-        let affected = cancelled.len() as u64;
-        total += affected;
-        if affected < ORPHAN_BATCH_SIZE as u64 {
-            break;
-        }
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(crate::broker::BrokerError::Database)?;
+    let cancelled =
+        crate::broker::terminalization::terminalize_in_tx(&mut transaction, &command).await?;
+    let stats: OrphanTaskScanStats = sqlx::query_as(
+        "SELECT last_scan_rows AS rows_selected,
+                last_candidate_rows AS candidates_returned
+         FROM horsies_recovery_scan_cursors
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .fetch_one(transaction.as_mut())
+    .await
+    .map_err(crate::broker::BrokerError::Database)?;
+    let rows_selected = u32::try_from(stats.rows_selected).map_err(|_| {
+        crate::broker::BrokerError::TerminalizationContract(
+            "horsies_cancel_orphaned_tasks: cursor row count is negative".to_owned(),
+        )
+    })?;
+    let candidates_returned = u32::try_from(stats.candidates_returned).map_err(|_| {
+        crate::broker::BrokerError::TerminalizationContract(
+            "horsies_cancel_orphaned_tasks: cursor candidate count is negative".to_owned(),
+        )
+    })?;
+    if usize::try_from(candidates_returned).unwrap_or(usize::MAX) != cancelled.len() {
+        return Err(crate::broker::BrokerError::TerminalizationContract(
+            "horsies_cancel_orphaned_tasks: cursor candidate count differs from outcome count"
+                .to_owned(),
+        ));
     }
-    Ok(total)
+    transaction
+        .commit()
+        .await
+        .map_err(crate::broker::BrokerError::Database)?;
+    Ok(OrphanTaskAuditReport {
+        state: "ready",
+        rows_selected,
+        candidates_returned,
+        cancelled: u32::try_from(cancelled.len()).unwrap_or(u32::MAX),
+        duration_ms: elapsed_millis(started),
+        refusals: 0,
+        errors: 0,
+    })
 }
 
 /// Expire unclaimed PENDING tasks whose `good_until` has passed.
