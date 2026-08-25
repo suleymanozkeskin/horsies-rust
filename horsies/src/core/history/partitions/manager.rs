@@ -9,8 +9,8 @@ use sqlx::{PgConnection, PgPool, Postgres};
 use uuid::Uuid;
 
 use crate::core::history::commands::{
-    CreateDailyHistoryLeaf, DetachExpiredHistoryLeaf, DropDetachedHistoryLeaf, EnsureLeafCoverage,
-    FinalizeInterruptedLeafDetach, InspectHistoryLeaf, LeafBounds, LeafRef,
+    is_safe_identifier, CreateDailyHistoryLeaf, DetachExpiredHistoryLeaf, DropDetachedHistoryLeaf,
+    EnsureLeafCoverage, FinalizeInterruptedLeafDetach, InspectHistoryLeaf, LeafBounds, LeafRef,
 };
 use crate::core::history::ddl::classes::FOREVER_CLASS_KEY;
 use crate::core::history::ddl::runtime_names::{
@@ -314,6 +314,12 @@ pub(crate) enum IndexRelationState {
     Foreign,
 }
 
+pub(crate) enum IndexRepairRemoval {
+    Absent,
+    Removed,
+    Foreign,
+}
+
 pub(crate) async fn index_relation_state(
     connection: &mut PgConnection,
     leaf_name: &str,
@@ -341,6 +347,72 @@ pub(crate) async fn index_relation_state(
         _ => Err(HistoryError::contract(
             "index relation probe returned an unknown state",
         )),
+    }
+}
+
+async fn rollback_index_repair_claim(connection: &mut PgConnection) -> Result<(), HistoryError> {
+    sqlx::query("ROLLBACK TO SAVEPOINT horsies_index_repair_claim")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("RELEASE SAVEPOINT horsies_index_repair_claim")
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn remove_attached_index_for_repair(
+    connection: &mut PgConnection,
+    leaf_name: &str,
+    index_name: &str,
+) -> Result<IndexRepairRemoval, HistoryError> {
+    if !is_safe_identifier(leaf_name) || !is_safe_identifier(index_name) {
+        return Err(HistoryError::contract(
+            "index repair names must be safe identifiers",
+        ));
+    }
+    match index_relation_state(connection, leaf_name, index_name).await? {
+        IndexRelationState::Absent => return Ok(IndexRepairRemoval::Absent),
+        IndexRelationState::Foreign => return Ok(IndexRepairRemoval::Foreign),
+        IndexRelationState::Attached => {}
+    }
+
+    let claim_name = format!("horsies_index_repair_{}", Uuid::new_v4().simple());
+    sqlx::query("SAVEPOINT horsies_index_repair_claim")
+        .execute(&mut *connection)
+        .await?;
+    let claim = async {
+        sqlx::query(&format!(
+            "ALTER INDEX IF EXISTS {index_name} RENAME TO {claim_name}"
+        ))
+        .execute(&mut *connection)
+        .await?;
+        match index_relation_state(connection, leaf_name, &claim_name).await? {
+            IndexRelationState::Absent => Ok(IndexRepairRemoval::Absent),
+            IndexRelationState::Foreign => Ok(IndexRepairRemoval::Foreign),
+            IndexRelationState::Attached => {
+                sqlx::query(&format!("DROP INDEX {claim_name}"))
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(IndexRepairRemoval::Removed)
+            }
+        }
+    }
+    .await;
+    match claim {
+        Ok(IndexRepairRemoval::Removed) => {
+            sqlx::query("RELEASE SAVEPOINT horsies_index_repair_claim")
+                .execute(connection)
+                .await?;
+            Ok(IndexRepairRemoval::Removed)
+        }
+        Ok(outcome @ (IndexRepairRemoval::Absent | IndexRepairRemoval::Foreign)) => {
+            rollback_index_repair_claim(connection).await?;
+            Ok(outcome)
+        }
+        Err(error) => {
+            rollback_index_repair_claim(connection).await?;
+            Err(error)
+        }
     }
 }
 
@@ -450,16 +522,15 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
                 });
             }
             if !physical.id_index_conformant {
-                match index_relation_state(connection, leaf.leaf_name(), &catalog.id_index_name)
-                    .await?
+                match remove_attached_index_for_repair(
+                    connection,
+                    leaf.leaf_name(),
+                    &catalog.id_index_name,
+                )
+                .await?
                 {
-                    IndexRelationState::Absent => {}
-                    IndexRelationState::Attached => {
-                        sqlx::query(&format!("DROP INDEX {}", catalog.id_index_name))
-                            .execute(&mut *connection)
-                            .await?;
-                    }
-                    IndexRelationState::Foreign => {
+                    IndexRepairRemoval::Absent | IndexRepairRemoval::Removed => {}
+                    IndexRepairRemoval::Foreign => {
                         return Ok(LeafCreation::CatalogConflict {
                             leaf_name: leaf.leaf_name().to_owned(),
                             kind: CatalogConflictKind::PhysicalNonconformant,

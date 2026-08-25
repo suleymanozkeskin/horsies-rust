@@ -1636,8 +1636,11 @@ async fn id_index_repair_refuses_a_name_reused_after_inspection() {
         .await
         .expect("create foreign index owner");
 
-    let (proxy, repair_pool, pause) =
-        pausing_proxied_pool(&database, "AND i.indcollation[0]").await;
+    let (proxy, repair_pool, pause) = pausing_proxied_pool(
+        &database,
+        "SELECT CASE\n             WHEN to_regclass($2) IS NULL",
+    )
+    .await;
     let repair_leaf = leaf.clone();
     let repair = tokio::spawn(async move {
         let mut transaction = repair_pool.begin().await.expect("begin index repair");
@@ -1655,10 +1658,13 @@ async fn id_index_repair_refuses_a_name_reused_after_inspection() {
         outcome
     });
     pause.wait_until_entered().await;
-    sqlx::query(&format!("DROP INDEX {id_index_name}"))
-        .execute(&database.pool)
-        .await
-        .expect("drop inspected malformed index");
+    let moved_index_name = "p3_index_reuse_moved";
+    sqlx::query(&format!(
+        "ALTER INDEX {id_index_name} RENAME TO {moved_index_name}"
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("rename the inspected malformed index");
     sqlx::query(&format!(
         "CREATE INDEX {id_index_name} ON {foreign_table} (value)"
     ))
