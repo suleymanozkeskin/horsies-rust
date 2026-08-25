@@ -549,14 +549,11 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
             }
             if !ordering {
                 let ordering_name = leaf_enqueued_index_name(leaf.leaf_name());
-                match index_relation_state(connection, leaf.leaf_name(), &ordering_name).await? {
-                    IndexRelationState::Absent => {}
-                    IndexRelationState::Attached => {
-                        sqlx::query(&format!("DROP INDEX {ordering_name}"))
-                            .execute(&mut *connection)
-                            .await?;
-                    }
-                    IndexRelationState::Foreign => {
+                match remove_attached_index_for_repair(connection, leaf.leaf_name(), &ordering_name)
+                    .await?
+                {
+                    IndexRepairRemoval::Absent | IndexRepairRemoval::Removed => {}
+                    IndexRepairRemoval::Foreign => {
                         return Ok(LeafCreation::CatalogConflict {
                             leaf_name: leaf.leaf_name().to_owned(),
                             kind: CatalogConflictKind::PhysicalNonconformant,
