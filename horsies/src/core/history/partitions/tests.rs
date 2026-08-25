@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Timelike, Utc};
@@ -44,7 +44,9 @@ use crate::core::history::names::{
     HEARTBEATS_TABLE, HEARTBEAT_CLASS_KEY, LEAF_CATALOG, LEAF_LOCK_KEY_FUNCTION, RETENTION_CLASSES,
     TASK_HISTORY_FOREVER, TASK_HISTORY_PARENT, TASK_LOOKUP_MANIFEST,
 };
-use crate::core::history::outcomes::{HealthFault, LeafCreation, LeafDrop, LeafInspection};
+use crate::core::history::outcomes::{
+    CatalogConflictKind, HealthFault, LeafCreation, LeafDrop, LeafInspection,
+};
 use crate::core::history::reads::publisher::StagedLoaderPublisher;
 
 use super::catalog::{
@@ -310,6 +312,50 @@ fn database_url() -> String {
     format!("postgresql://postgres:{password}@localhost:5432/horsies-rust-port")
 }
 
+#[derive(Clone)]
+struct StatementPause {
+    pattern: Arc<str>,
+    consumed: Arc<AtomicBool>,
+    pending: Arc<AtomicBool>,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl StatementPause {
+    fn new(pattern: impl Into<Arc<str>>) -> Self {
+        Self {
+            pattern: pattern.into(),
+            consumed: Arc::new(AtomicBool::new(false)),
+            pending: Arc::new(AtomicBool::new(false)),
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    fn inspect(&self, query: &str) {
+        if query.contains(self.pattern.as_ref()) && !self.consumed.swap(true, Ordering::SeqCst) {
+            self.pending.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn pause_after_ready(&self) {
+        if self.pending.swap(false, Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.entered.notified())
+            .await
+            .expect("matching SQL statement did not reach its response barrier");
+    }
+
+    fn resume(&self) {
+        self.release.notify_one();
+    }
+}
+
 #[derive(Default)]
 struct FrontendStatementParser {
     startup: bool,
@@ -330,6 +376,7 @@ impl FrontendStatementParser {
         statements: &AtomicUsize,
         pending_responses: &AtomicUsize,
         sql: &Mutex<Vec<String>>,
+        pause: Option<&StatementPause>,
     ) {
         self.buffered.extend_from_slice(bytes);
         loop {
@@ -364,9 +411,13 @@ impl FrontendStatementParser {
                     statements.fetch_add(1, Ordering::SeqCst);
                     pending_responses.fetch_add(1, Ordering::SeqCst);
                     if let Some(query) = body.strip_suffix(&[0]) {
+                        let query = String::from_utf8_lossy(query);
+                        if let Some(pause) = pause {
+                            pause.inspect(&query);
+                        }
                         sql.lock()
                             .expect("statement SQL lock")
-                            .push(String::from_utf8_lossy(query).into_owned());
+                            .push(query.into_owned());
                     }
                 }
                 b'E' => {
@@ -377,14 +428,43 @@ impl FrontendStatementParser {
                     if let Some(name_end) = body.iter().position(|byte| *byte == 0) {
                         let query = &body[name_end + 1..];
                         if let Some(query_end) = query.iter().position(|byte| *byte == 0) {
+                            let query = String::from_utf8_lossy(&query[..query_end]);
+                            if let Some(pause) = pause {
+                                pause.inspect(&query);
+                            }
                             sql.lock()
                                 .expect("statement SQL lock")
-                                .push(String::from_utf8_lossy(&query[..query_end]).into_owned());
+                                .push(query.into_owned());
                         }
                     }
                 }
                 _ => {}
             }
+            self.buffered.drain(..message_length);
+        }
+    }
+}
+
+#[derive(Default)]
+struct BackendReadyParser {
+    buffered: Vec<u8>,
+}
+
+impl BackendReadyParser {
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        self.buffered.extend_from_slice(bytes);
+        let mut ready = false;
+        loop {
+            if self.buffered.len() < 5 {
+                return ready;
+            }
+            let tag = self.buffered[0];
+            let length = u32::from_be_bytes(self.buffered[1..5].try_into().unwrap()) as usize;
+            let message_length = length + 1;
+            if length < 4 || self.buffered.len() < message_length {
+                return ready;
+            }
+            ready |= tag == b'Z';
             self.buffered.drain(..message_length);
         }
     }
@@ -401,6 +481,14 @@ struct SqlStatementProxy {
 
 impl SqlStatementProxy {
     async fn start(backend: &PgConnectOptions, delay_ms: usize) -> Self {
+        Self::start_with_pause(backend, delay_ms, None).await
+    }
+
+    async fn start_with_pause(
+        backend: &PgConnectOptions,
+        delay_ms: usize,
+        pause: Option<StatementPause>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind SQL statement proxy");
@@ -425,6 +513,7 @@ impl SqlStatementProxy {
                 let connection_statements = Arc::clone(&accept_statements);
                 let connection_pending = Arc::clone(&accept_pending);
                 let connection_sql = Arc::clone(&accept_sql);
+                let connection_pause = pause.clone();
                 let host = backend_host.clone();
                 tokio::spawn(async move {
                     let server = TcpStream::connect((host.as_str(), backend_port))
@@ -448,6 +537,7 @@ impl SqlStatementProxy {
                                 &connection_statements,
                                 &connection_pending,
                                 &connection_sql,
+                                connection_pause.as_ref(),
                             );
                             server_write
                                 .write_all(&buffer[..read])
@@ -456,6 +546,7 @@ impl SqlStatementProxy {
                         }
                     };
                     let server_to_client = async {
+                        let mut ready_parser = BackendReadyParser::default();
                         let mut buffer = vec![0_u8; 16 * 1024];
                         loop {
                             let read = server_read
@@ -471,6 +562,11 @@ impl SqlStatementProxy {
                                     (delay_ms * delayed) as u64,
                                 ))
                                 .await;
+                            }
+                            if ready_parser.push(&buffer[..read]) {
+                                if let Some(pause) = connection_pause.as_ref() {
+                                    pause.pause_after_ready().await;
+                                }
                             }
                             client_write
                                 .write_all(&buffer[..read])
@@ -543,6 +639,30 @@ async fn proxied_pool(
         .expect("warm proxied PostgreSQL connection");
     proxy.reset();
     (proxy, pool)
+}
+
+async fn pausing_proxied_pool(
+    database: &TestDatabase,
+    pattern: &str,
+) -> (SqlStatementProxy, PgPool, StatementPause) {
+    let backend = PgConnectOptions::from_str(&database_url())
+        .expect("invalid test database URL")
+        .database(&database.database_name)
+        .ssl_mode(PgSslMode::Disable);
+    let pause = StatementPause::new(Arc::<str>::from(pattern));
+    let proxy = SqlStatementProxy::start_with_pause(&backend, 0, Some(pause.clone())).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            backend
+                .clone()
+                .host("127.0.0.1")
+                .port(proxy.port)
+                .ssl_mode(PgSslMode::Disable),
+        )
+        .await
+        .expect("connect through pausing SQL statement proxy");
+    (proxy, pool, pause)
 }
 
 async fn register_class(pool: &PgPool, class_key: &str, days: i64) -> String {
@@ -1468,6 +1588,104 @@ async fn coverage_repairs_a_nondefault_heartbeat_operator_class() {
         .await
         .expect("read repaired heartbeat index definition");
     assert!(index_definition.ends_with("USING btree (task_id, role, sent_at DESC)"));
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn id_index_repair_refuses_a_name_reused_after_inspection() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let class_key = "p3_index_reuse_30d";
+    let parent = register_class(&database.pool, class_key, 30).await;
+    let now = database_now(
+        database
+            .pool
+            .acquire()
+            .await
+            .expect("acquire database clock")
+            .as_mut(),
+    )
+    .await
+    .expect("read database clock");
+    let today = now
+        .with_hour(0)
+        .and_then(|value| value.with_minute(0))
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("truncate current day");
+    let leaf = leaf_ref(&parent, class_key, today);
+    assert!(matches!(
+        create_leaf(&database.pool, &leaf).await,
+        LeafCreation::Created { .. }
+    ));
+    let id_index_name = leaf_id_index_name(leaf.leaf_name());
+    sqlx::query(&format!("DROP INDEX {id_index_name}"))
+        .execute(&database.pool)
+        .await
+        .expect("drop canonical task-ID index");
+    sqlx::query(&format!(
+        "CREATE INDEX {id_index_name} ON {} (task_id DESC)",
+        leaf.leaf_name()
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("create malformed task-ID index");
+    let foreign_table = "p3_index_reuse_foreign";
+    sqlx::query(&format!("CREATE TABLE {foreign_table} (value integer)"))
+        .execute(&database.pool)
+        .await
+        .expect("create foreign index owner");
+
+    let (proxy, repair_pool, pause) =
+        pausing_proxied_pool(&database, "AND i.indcollation[0]").await;
+    let repair_leaf = leaf.clone();
+    let repair = tokio::spawn(async move {
+        let mut transaction = repair_pool.begin().await.expect("begin index repair");
+        let outcome = create_daily_leaf(
+            transaction.as_mut(),
+            &CreateDailyHistoryLeaf::new(repair_leaf).expect("index repair command"),
+            &UnpublishedLoader,
+        )
+        .await
+        .expect("classify reused index name");
+        transaction
+            .rollback()
+            .await
+            .expect("roll back index repair");
+        outcome
+    });
+    pause.wait_until_entered().await;
+    sqlx::query(&format!("DROP INDEX {id_index_name}"))
+        .execute(&database.pool)
+        .await
+        .expect("drop inspected malformed index");
+    sqlx::query(&format!(
+        "CREATE INDEX {id_index_name} ON {foreign_table} (value)"
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("reuse the schema index name on a foreign table");
+    pause.resume();
+
+    let outcome = repair.await.expect("join index repair");
+    assert!(matches!(
+        outcome,
+        LeafCreation::CatalogConflict {
+            kind: CatalogConflictKind::PhysicalNonconformant,
+            ..
+        }
+    ));
+    let owner: String = sqlx::query_scalar(
+        "SELECT index_state.indrelid::regclass::text
+         FROM pg_index AS index_state
+         WHERE index_state.indexrelid = to_regclass($1)",
+    )
+    .bind(&id_index_name)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read reused index owner");
+    assert_eq!(owner, foreign_table);
+    proxy.stop().await;
     database.drop().await;
 }
 

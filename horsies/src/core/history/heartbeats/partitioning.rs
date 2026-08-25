@@ -21,7 +21,8 @@ use crate::core::history::partitions::locks::{
     try_lock_leaf_for_transaction, try_lock_relation_exclusive_for_transaction, LeafLockAttempt,
 };
 use crate::core::history::partitions::manager::{
-    detach_expired_leaf, drop_detached_leaf, inspect_leaf, DetachExpiredLeafOutcome, NoQuarantine,
+    detach_expired_leaf, drop_detached_leaf, index_relation_state, inspect_leaf,
+    DetachExpiredLeafOutcome, IndexRelationState, NoQuarantine,
 };
 use crate::core::history::partitions::publication::LoaderPublication;
 
@@ -304,14 +305,15 @@ pub async fn create_hourly_heartbeat_leaf(
                     leaf_name: leaf.leaf_name().to_owned(),
                 });
             }
-            match (physical.id_index_relation_exists, physical.id_index_exists) {
-                (false, _) => {}
-                (true, true) => {
+            match index_relation_state(connection, leaf.leaf_name(), &catalog.id_index_name).await?
+            {
+                IndexRelationState::Absent => {}
+                IndexRelationState::Attached => {
                     sqlx::query(&format!("DROP INDEX {}", catalog.id_index_name))
                         .execute(&mut *connection)
                         .await?;
                 }
-                (true, false) => {
+                IndexRelationState::Foreign => {
                     return Ok(LeafCreation::CatalogConflict {
                         leaf_name: leaf.leaf_name().to_owned(),
                         kind: CatalogConflictKind::PhysicalNonconformant,

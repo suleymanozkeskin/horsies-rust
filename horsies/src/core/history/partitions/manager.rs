@@ -308,13 +308,13 @@ pub async fn inspect_leaf(
     }
 }
 
-enum IndexRelationState {
+pub(crate) enum IndexRelationState {
     Absent,
     Attached,
     Foreign,
 }
 
-async fn index_relation_state(
+pub(crate) async fn index_relation_state(
     connection: &mut PgConnection,
     leaf_name: &str,
     index_name: &str,
@@ -450,14 +450,16 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
                 });
             }
             if !physical.id_index_conformant {
-                match (physical.id_index_relation_exists, physical.id_index_exists) {
-                    (false, _) => {}
-                    (true, true) => {
+                match index_relation_state(connection, leaf.leaf_name(), &catalog.id_index_name)
+                    .await?
+                {
+                    IndexRelationState::Absent => {}
+                    IndexRelationState::Attached => {
                         sqlx::query(&format!("DROP INDEX {}", catalog.id_index_name))
                             .execute(&mut *connection)
                             .await?;
                     }
-                    (true, false) => {
+                    IndexRelationState::Foreign => {
                         return Ok(LeafCreation::CatalogConflict {
                             leaf_name: leaf.leaf_name().to_owned(),
                             kind: CatalogConflictKind::PhysicalNonconformant,

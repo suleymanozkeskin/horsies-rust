@@ -63,8 +63,6 @@ pub struct LeafPhysicalState {
     pub parent_exists: bool,
     pub partition_bound: Option<String>,
     pub partition_bound_matches_expected: bool,
-    pub id_index_relation_exists: bool,
-    pub id_index_exists: bool,
     pub id_index_conformant: bool,
     pub detach_pending: Option<bool>,
 }
@@ -336,8 +334,6 @@ struct PhysicalRaw {
     parent_exists: bool,
     partition_bound: Option<String>,
     partition_bound_matches_expected: bool,
-    id_index_relation_exists: bool,
-    id_index_exists: bool,
     id_index_conformant: bool,
     detach_pending: Option<bool>,
 }
@@ -390,11 +386,6 @@ pub async fn read_leaf_physical_state(
                     FROM pg_class AS relation
                     WHERE relation.oid = to_regclass($1)
                 ), false) AS partition_bound_matches_expected,
-                to_regclass($3) IS NOT NULL AS id_index_relation_exists,
-                EXISTS (
-                    SELECT 1 FROM selected_index
-                    WHERE selected_index.indrelid = to_regclass($1)
-                ) AS id_index_exists,
                 EXISTS (
                     SELECT 1 FROM selected_index
                     WHERE selected_index.indrelid = to_regclass($1)
@@ -509,8 +500,6 @@ pub async fn read_leaf_physical_state(
         parent_exists: row.parent_exists,
         partition_bound: row.partition_bound,
         partition_bound_matches_expected: row.partition_bound_matches_expected,
-        id_index_relation_exists: row.id_index_relation_exists,
-        id_index_exists: row.id_index_exists,
         id_index_conformant: row.id_index_conformant,
         detach_pending: row.detach_pending,
     })
