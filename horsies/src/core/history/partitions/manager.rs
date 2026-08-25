@@ -358,6 +358,7 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
             || catalog.class_key != leaf.class_key()
             || catalog.lower_anchor != leaf.bounds().lower()
             || catalog.upper_anchor != leaf.bounds().upper()
+            || catalog.detached_at.is_some()
             || catalog.dropped_at.is_some()
         {
             return Ok(LeafCreation::CatalogConflict {
@@ -371,6 +372,13 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
                 leaf_name: leaf.leaf_name().to_owned(),
                 kind: CatalogConflictKind::PhysicalNonconformant,
                 detail: "attached leaf partition bound differs from catalog".to_owned(),
+            });
+        }
+        if physical.detach_pending != Some(false) {
+            return Ok(LeafCreation::CatalogConflict {
+                leaf_name: leaf.leaf_name().to_owned(),
+                kind: CatalogConflictKind::PhysicalNonconformant,
+                detail: "required leaf is not attached to its cataloged parent".to_owned(),
             });
         }
         let ordering = read_leaf_ordering_index_exists(connection, leaf.leaf_name()).await?;
@@ -467,6 +475,7 @@ async fn daily_leaf_is_conformant(
         || catalog.class_key != leaf.class_key()
         || catalog.lower_anchor != leaf.bounds().lower()
         || catalog.upper_anchor != leaf.bounds().upper()
+        || catalog.detached_at.is_some()
         || catalog.dropped_at.is_some()
     {
         return Ok(false);
@@ -480,6 +489,7 @@ async fn daily_leaf_is_conformant(
     .await?;
     if !physical.relation_exists
         || !physical.id_index_exists
+        || physical.detach_pending != Some(false)
         || physical.partition_bound.as_deref() != Some(catalog.partition_bound.as_str())
     {
         return Ok(false);

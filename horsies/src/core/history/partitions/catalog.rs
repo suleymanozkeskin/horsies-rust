@@ -340,7 +340,11 @@ pub async fn read_leaf_physical_state(
     let result = sqlx::query_as::<_, PhysicalRaw>(
         "SELECT to_regclass($1) IS NOT NULL AS leaf_exists,
                 to_regclass($2) IS NOT NULL AS parent_exists,
-                to_regclass($3) IS NOT NULL AS id_index_exists,
+                EXISTS (
+                    SELECT 1 FROM pg_index AS index_state
+                    WHERE index_state.indexrelid = to_regclass($3)
+                      AND index_state.indrelid = to_regclass($1)
+                ) AS id_index_exists,
                 (SELECT pg_get_expr(c.relpartbound, c.oid) FROM pg_class AS c
                  WHERE c.oid = to_regclass($1)) AS partition_bound,
                 (SELECT i.inhdetachpending FROM pg_inherits AS i

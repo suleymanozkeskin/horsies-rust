@@ -1,12 +1,16 @@
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{Duration, Timelike, Utc};
 use serial_test::serial;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{Connection, PgConnection, PgPool};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::broker::migrations::run_horsies_migrations;
@@ -27,7 +31,8 @@ use crate::core::history::heartbeats::partitioning::{
 };
 use crate::core::history::maintenance::coverage::{
     ensure_partition_coverage, ensure_partition_coverage_in_pool, ensure_startup_coverage,
-    CoverageOutcome, StartupCoverageOutcome,
+    ensure_startup_coverage_in_pool, CoverageOutcome, DeclaredRetentionClass,
+    StartupCoverageOutcome,
 };
 use crate::core::history::maintenance::gate::{
     active_maintenance_session, begin_archive_maintenance, finish_archive_maintenance,
@@ -39,6 +44,7 @@ use crate::core::history::names::{
     TASK_HISTORY_PARENT,
 };
 use crate::core::history::outcomes::{HealthFault, LeafCreation, LeafDrop, LeafInspection};
+use crate::core::history::reads::publisher::StagedLoaderPublisher;
 
 use super::catalog::{
     capture_partition_bound_utc, database_now, read_attached_birth_floor, read_leaf_catalog_row,
@@ -264,6 +270,241 @@ fn database_url() -> String {
         .find_map(|(key, value)| (key.trim() == "DB_PASSWORD").then(|| value.trim()))
         .expect("DB_PASSWORD in workspace .env");
     format!("postgresql://postgres:{password}@localhost:5432/horsies-rust-port")
+}
+
+#[derive(Default)]
+struct FrontendStatementParser {
+    startup: bool,
+    buffered: Vec<u8>,
+}
+
+impl FrontendStatementParser {
+    fn new() -> Self {
+        Self {
+            startup: true,
+            buffered: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        bytes: &[u8],
+        statements: &AtomicUsize,
+        pending_responses: &AtomicUsize,
+        sql: &Mutex<Vec<String>>,
+    ) {
+        self.buffered.extend_from_slice(bytes);
+        loop {
+            if self.startup {
+                if self.buffered.len() < 4 {
+                    return;
+                }
+                let length = u32::from_be_bytes(self.buffered[..4].try_into().unwrap()) as usize;
+                if length < 8 || self.buffered.len() < length {
+                    return;
+                }
+                let code = u32::from_be_bytes(self.buffered[4..8].try_into().unwrap());
+                self.buffered.drain(..length);
+                if code != 80_877_103 && code != 80_877_104 {
+                    self.startup = false;
+                }
+                continue;
+            }
+
+            if self.buffered.len() < 5 {
+                return;
+            }
+            let tag = self.buffered[0];
+            let length = u32::from_be_bytes(self.buffered[1..5].try_into().unwrap()) as usize;
+            let message_length = length + 1;
+            if length < 4 || self.buffered.len() < message_length {
+                return;
+            }
+            let body = &self.buffered[5..message_length];
+            match tag {
+                b'Q' => {
+                    statements.fetch_add(1, Ordering::SeqCst);
+                    pending_responses.fetch_add(1, Ordering::SeqCst);
+                    if let Some(query) = body.strip_suffix(&[0]) {
+                        sql.lock()
+                            .expect("statement SQL lock")
+                            .push(String::from_utf8_lossy(query).into_owned());
+                    }
+                }
+                b'E' => {
+                    statements.fetch_add(1, Ordering::SeqCst);
+                    pending_responses.fetch_add(1, Ordering::SeqCst);
+                }
+                b'P' => {
+                    if let Some(name_end) = body.iter().position(|byte| *byte == 0) {
+                        let query = &body[name_end + 1..];
+                        if let Some(query_end) = query.iter().position(|byte| *byte == 0) {
+                            sql.lock()
+                                .expect("statement SQL lock")
+                                .push(String::from_utf8_lossy(&query[..query_end]).into_owned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.buffered.drain(..message_length);
+        }
+    }
+}
+
+struct SqlStatementProxy {
+    port: u16,
+    statements: Arc<AtomicUsize>,
+    pending_responses: Arc<AtomicUsize>,
+    sql: Arc<Mutex<Vec<String>>>,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl SqlStatementProxy {
+    async fn start(backend: &PgConnectOptions, delay_ms: usize) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind SQL statement proxy");
+        let port = listener.local_addr().expect("proxy address").port();
+        let backend_host = backend.get_host().to_owned();
+        let backend_port = backend.get_port();
+        let statements = Arc::new(AtomicUsize::new(0));
+        let pending_responses = Arc::new(AtomicUsize::new(0));
+        let sql = Arc::new(Mutex::new(Vec::new()));
+        let cancel = CancellationToken::new();
+        let accept_cancel = cancel.clone();
+        let accept_statements = Arc::clone(&statements);
+        let accept_pending = Arc::clone(&pending_responses);
+        let accept_sql = Arc::clone(&sql);
+        let task = tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    _ = accept_cancel.cancelled() => return,
+                    accepted = listener.accept() => accepted,
+                };
+                let (client, _) = accepted.expect("accept proxied PostgreSQL connection");
+                let connection_statements = Arc::clone(&accept_statements);
+                let connection_pending = Arc::clone(&accept_pending);
+                let connection_sql = Arc::clone(&accept_sql);
+                let host = backend_host.clone();
+                tokio::spawn(async move {
+                    let server = TcpStream::connect((host.as_str(), backend_port))
+                        .await
+                        .expect("connect SQL statement proxy to PostgreSQL");
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+                    let client_to_server = async {
+                        let mut parser = FrontendStatementParser::new();
+                        let mut buffer = vec![0_u8; 16 * 1024];
+                        loop {
+                            let read = client_read
+                                .read(&mut buffer)
+                                .await
+                                .expect("read proxied PostgreSQL client");
+                            if read == 0 {
+                                return;
+                            }
+                            parser.push(
+                                &buffer[..read],
+                                &connection_statements,
+                                &connection_pending,
+                                &connection_sql,
+                            );
+                            server_write
+                                .write_all(&buffer[..read])
+                                .await
+                                .expect("write proxied PostgreSQL server");
+                        }
+                    };
+                    let server_to_client = async {
+                        let mut buffer = vec![0_u8; 16 * 1024];
+                        loop {
+                            let read = server_read
+                                .read(&mut buffer)
+                                .await
+                                .expect("read proxied PostgreSQL server");
+                            if read == 0 {
+                                return;
+                            }
+                            let delayed = connection_pending.swap(0, Ordering::SeqCst);
+                            if delayed > 0 && delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    (delay_ms * delayed) as u64,
+                                ))
+                                .await;
+                            }
+                            client_write
+                                .write_all(&buffer[..read])
+                                .await
+                                .expect("write proxied PostgreSQL client");
+                        }
+                    };
+                    tokio::select! {
+                        _ = client_to_server => {}
+                        _ = server_to_client => {}
+                    }
+                });
+            }
+        });
+        Self {
+            port,
+            statements,
+            pending_responses,
+            sql,
+            cancel,
+            task,
+        }
+    }
+
+    fn reset(&self) {
+        self.statements.store(0, Ordering::SeqCst);
+        self.pending_responses.store(0, Ordering::SeqCst);
+        self.sql.lock().expect("statement SQL lock").clear();
+    }
+
+    fn statement_count(&self) -> usize {
+        self.statements.load(Ordering::SeqCst)
+    }
+
+    fn sql(&self) -> Vec<String> {
+        self.sql.lock().expect("statement SQL lock").clone()
+    }
+
+    async fn stop(self) {
+        self.cancel.cancel();
+        self.task.await.expect("stop SQL statement proxy");
+    }
+}
+
+async fn proxied_pool(
+    database: &TestDatabase,
+    delay_ms: usize,
+    max_connections: u32,
+) -> (SqlStatementProxy, PgPool) {
+    let backend = PgConnectOptions::from_str(&database_url())
+        .expect("invalid test database URL")
+        .database(&database.database_name)
+        .ssl_mode(PgSslMode::Disable);
+    let proxy = SqlStatementProxy::start(&backend, delay_ms).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(max_connections)
+        .test_before_acquire(true)
+        .connect_with(
+            backend
+                .clone()
+                .host("127.0.0.1")
+                .port(proxy.port)
+                .ssl_mode(PgSslMode::Disable),
+        )
+        .await
+        .expect("connect through SQL statement proxy");
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .expect("warm proxied PostgreSQL connection");
+    proxy.reset();
+    (proxy, pool)
 }
 
 async fn register_class(pool: &PgPool, class_key: &str, days: i64) -> String {
@@ -788,6 +1029,242 @@ async fn pool_coverage_releases_each_leaf_transaction_before_returning() {
     .await
     .expect("count advisory locks");
     assert_eq!(advisory_locks, 0);
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn healthy_pool_coverage_has_a_fixed_statement_budget() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let declared: Vec<DeclaredRetentionClass> = (0..50)
+        .map(|index| DeclaredRetentionClass {
+            class_key: format!("rtt_class_{index:02}"),
+            duration: Duration::days(7 + i64::from(index)),
+        })
+        .collect();
+
+    let first = ensure_partition_coverage_in_pool(
+        &database.pool,
+        8,
+        8,
+        &declared[..1],
+        &StagedLoaderPublisher,
+    )
+    .await
+    .expect("create initial coverage");
+    assert!(matches!(first, CoverageOutcome::Ensured(_)));
+
+    for (history_horizon, heartbeat_horizon) in [(2, 2), (8, 8)] {
+        let setup = ensure_partition_coverage_in_pool(
+            &database.pool,
+            history_horizon,
+            heartbeat_horizon,
+            &declared[..1],
+            &StagedLoaderPublisher,
+        )
+        .await
+        .expect("set healthy horizon coverage");
+        assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+        let (proxy, pool) = proxied_pool(&database, 0, 1).await;
+        sqlx::query("SELECT set_config('timezone', 'America/Los_Angeles', false)")
+            .execute(&pool)
+            .await
+            .expect("set proxied session timezone");
+        proxy.reset();
+        let outcome = ensure_partition_coverage_in_pool(
+            &pool,
+            history_horizon,
+            heartbeat_horizon,
+            &declared[..1],
+            &StagedLoaderPublisher,
+        )
+        .await
+        .expect("healthy horizon coverage");
+        assert!(matches!(outcome, CoverageOutcome::Ensured(_)));
+        assert_eq!(proxy.statement_count(), 3);
+        assert!(!proxy.sql().iter().any(|statement| {
+            statement.starts_with("BEGIN") || statement.contains("pg_try_advisory_xact_lock")
+        }));
+        let timezone: String = sqlx::query_scalar("SHOW timezone")
+            .fetch_one(&pool)
+            .await
+            .expect("read proxied session timezone");
+        assert_eq!(timezone, "America/Los_Angeles");
+        pool.close().await;
+        proxy.stop().await;
+    }
+
+    for class_count in [10, 50] {
+        let setup = ensure_partition_coverage_in_pool(
+            &database.pool,
+            2,
+            2,
+            &declared[..class_count],
+            &StagedLoaderPublisher,
+        )
+        .await
+        .expect("extend class coverage");
+        assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+
+        let (proxy, pool) = proxied_pool(&database, 0, 1).await;
+        let outcome = ensure_partition_coverage_in_pool(
+            &pool,
+            2,
+            2,
+            &declared[..class_count],
+            &StagedLoaderPublisher,
+        )
+        .await
+        .expect("healthy class coverage");
+        assert!(matches!(outcome, CoverageOutcome::Ensured(_)));
+        assert_eq!(proxy.statement_count(), 3);
+        pool.close().await;
+        proxy.stop().await;
+    }
+
+    let delay_ms = 20_usize;
+    let (proxy, pool) = proxied_pool(&database, delay_ms, 1).await;
+    let started = tokio::time::Instant::now();
+    let outcome = ensure_partition_coverage_in_pool(&pool, 2, 2, &declared, &StagedLoaderPublisher)
+        .await
+        .expect("healthy high-RTT coverage");
+    let elapsed = started.elapsed();
+    assert!(matches!(outcome, CoverageOutcome::Ensured(_)));
+    assert_eq!(proxy.statement_count(), 3);
+    assert!(elapsed >= std::time::Duration::from_millis((delay_ms * 3) as u64));
+    assert!(elapsed < std::time::Duration::from_millis((delay_ms * 3 + 500) as u64));
+    pool.close().await;
+    proxy.stop().await;
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn pool_coverage_repairs_only_the_damaged_leaf_in_one_mutation_transaction() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let setup = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("create repair coverage");
+    assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+    let damaged_index: String = sqlx::query_scalar(&format!(
+        "SELECT id_index_name FROM {LEAF_CATALOG}
+         WHERE class_key = 'standard_30d' AND dropped_at IS NULL
+         ORDER BY lower_anchor LIMIT 1"
+    ))
+    .fetch_one(&database.pool)
+    .await
+    .expect("read damaged index name");
+    sqlx::query(&format!("DROP INDEX {damaged_index}"))
+        .execute(&database.pool)
+        .await
+        .expect("drop one required index");
+
+    let (proxy, pool) = proxied_pool(&database, 0, 4).await;
+    let outcome = ensure_partition_coverage_in_pool(&pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("repair one damaged leaf");
+    let CoverageOutcome::Ensured(ensured) = outcome else {
+        panic!("damaged index must be repairable");
+    };
+    assert_eq!(ensured.created_history_leaves, 0);
+    assert_eq!(ensured.created_heartbeat_leaves, 0);
+    let sql = proxy.sql();
+    assert_eq!(
+        sql.iter()
+            .filter(|statement| statement.starts_with("BEGIN"))
+            .count(),
+        2,
+        "one gate transaction and one leaf mutation transaction are required"
+    );
+    assert_eq!(
+        sql.iter()
+            .filter(|statement| {
+                statement.contains("pg_try_advisory_xact_lock(horsies_task_history_leaf_lock_key")
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        sql.iter()
+            .filter(|statement| statement.contains(&format!("CREATE INDEX {damaged_index}")))
+            .count(),
+        1
+    );
+    pool.close().await;
+    proxy.stop().await;
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn busy_coverage_gate_keeps_startup_ready_when_current_heartbeat_exists() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let setup = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("create current heartbeat coverage");
+    assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+
+    let mut holder = database
+        .pool
+        .begin()
+        .await
+        .expect("begin coverage gate holder");
+    let held: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(
+             hashtextextended('horsies:partition-coverage:v1', 1601)
+         )",
+    )
+    .fetch_one(holder.as_mut())
+    .await
+    .expect("hold coverage maintenance gate");
+    assert!(held);
+
+    let startup = ensure_startup_coverage_in_pool(&database.pool, 3, 3, &[], &UnpublishedLoader)
+        .await
+        .expect("check startup under a busy coverage gate");
+    let StartupCoverageOutcome::Ready(CoverageOutcome::Failed(failure)) = startup else {
+        panic!("current heartbeat coverage must keep non-owner startup ready");
+    };
+    assert_eq!(failure.stage, "coverage_gate_busy");
+    assert!(failure.heartbeat_covered_now);
+    holder
+        .rollback()
+        .await
+        .expect("release coverage gate holder");
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn busy_coverage_gate_refuses_startup_when_current_heartbeat_is_absent() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let mut holder = database
+        .pool
+        .begin()
+        .await
+        .expect("begin coverage gate holder");
+    let held: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock(
+             hashtextextended('horsies:partition-coverage:v1', 1601)
+         )",
+    )
+    .fetch_one(holder.as_mut())
+    .await
+    .expect("hold coverage maintenance gate");
+    assert!(held);
+
+    let startup = ensure_startup_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("check cold startup under a busy coverage gate");
+    let StartupCoverageOutcome::Refused(CoverageOutcome::Failed(failure)) = startup else {
+        panic!("missing current heartbeat coverage must refuse startup");
+    };
+    assert_eq!(failure.stage, "coverage_gate_busy");
+    assert!(!failure.heartbeat_covered_now);
+    holder
+        .rollback()
+        .await
+        .expect("release coverage gate holder");
     database.drop().await;
 }
 
