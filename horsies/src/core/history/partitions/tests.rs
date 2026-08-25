@@ -1652,9 +1652,9 @@ async fn id_index_repair_refuses_a_name_reused_after_inspection() {
         .await
         .expect("classify reused index name");
         transaction
-            .rollback()
+            .commit()
             .await
-            .expect("roll back index repair");
+            .expect("commit the refused index repair");
         outcome
     });
     pause.wait_until_entered().await;
