@@ -18,6 +18,7 @@ use crate::core::history::commands::{
     CollectPartitionHealth, CreateDailyHistoryLeaf, DetachExpiredHistoryLeaf,
     DropDetachedHistoryLeaf, EnsureLeafCoverage, InspectHistoryLeaf, LeafBounds, LeafRef,
 };
+use crate::core::history::cutover::relocation::{relocate_terminal_batch, RelocationOutcome};
 use crate::core::history::ddl::classes::{
     finite_class_parent_name, register_finite_retention_class, ClassRegistration,
 };
@@ -49,6 +50,7 @@ use crate::core::history::reads::publisher::StagedLoaderPublisher;
 use super::catalog::{
     capture_partition_bound_utc, database_now, read_attached_birth_floor, read_leaf_catalog_row,
     read_leaf_physical_state, read_manifest_leaf_rows, LeafIndexKind,
+    LeafPartitionBoundExpectation,
 };
 use super::forever::{ensure_forever_range_partitioning, FOREVER_LEGACY_LEAF};
 use super::health::collect_partition_health;
@@ -1391,7 +1393,7 @@ async fn coverage_repairs_same_name_wrong_shape_and_invalid_indexes() {
             &heartbeat.leaf_name,
             &heartbeat.parent_name,
             &heartbeat.id_index_name,
-            &heartbeat_bounds,
+            LeafPartitionBoundExpectation::Requested(&heartbeat_bounds),
             LeafIndexKind::Heartbeat,
         )
         .await
@@ -1404,7 +1406,7 @@ async fn coverage_repairs_same_name_wrong_shape_and_invalid_indexes() {
             &history.leaf_name,
             &history.parent_name,
             &history.id_index_name,
-            &history_bounds,
+            LeafPartitionBoundExpectation::Requested(&history_bounds),
             LeafIndexKind::History,
         )
         .await
@@ -1412,6 +1414,60 @@ async fn coverage_repairs_same_name_wrong_shape_and_invalid_indexes() {
         .id_index_conformant
     );
     drop(connection);
+    database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn coverage_repairs_a_nondefault_heartbeat_operator_class() {
+    let database = TestDatabase::create_with_connections(4).await;
+    let setup = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("create operator-class repair coverage");
+    assert!(matches!(setup, CoverageOutcome::Ensured(_)));
+    let heartbeat = sqlx::query_as::<_, super::catalog::LeafCatalogRow>(&format!(
+        "SELECT leaf_name, parent_name, class_key, lower_anchor, upper_anchor,
+                index_schema_version, id_index_name, partition_bound, min_birth_at,
+                min_birth_verified, created_at, detached_at, dropped_at
+         FROM {LEAF_CATALOG}
+         WHERE class_key = $1
+           AND lower_anchor <= statement_timestamp()
+           AND upper_anchor > statement_timestamp()"
+    ))
+    .bind(HEARTBEAT_CLASS_KEY)
+    .fetch_one(&database.pool)
+    .await
+    .expect("read current heartbeat catalog row");
+    sqlx::query(&format!("DROP INDEX {}", heartbeat.id_index_name))
+        .execute(&database.pool)
+        .await
+        .expect("drop canonical heartbeat index");
+    sqlx::query(&format!(
+        "CREATE INDEX {} ON {} (
+             task_id, role varchar_pattern_ops, sent_at DESC
+         )",
+        heartbeat.id_index_name, heartbeat.leaf_name
+    ))
+    .execute(&database.pool)
+    .await
+    .expect("create heartbeat index with a nondefault operator class");
+    let index_definition: String = sqlx::query_scalar("SELECT pg_get_indexdef(to_regclass($1))")
+        .bind(&heartbeat.id_index_name)
+        .fetch_one(&database.pool)
+        .await
+        .expect("read nondefault heartbeat index definition");
+    assert!(index_definition.contains("varchar_pattern_ops"));
+
+    let outcome = ensure_partition_coverage_in_pool(&database.pool, 2, 2, &[], &UnpublishedLoader)
+        .await
+        .expect("repair nondefault heartbeat operator class");
+    assert!(matches!(outcome, CoverageOutcome::Ensured(_)));
+    let index_definition: String = sqlx::query_scalar("SELECT pg_get_indexdef(to_regclass($1))")
+        .bind(&heartbeat.id_index_name)
+        .fetch_one(&database.pool)
+        .await
+        .expect("read repaired heartbeat index definition");
+    assert!(index_definition.ends_with("USING btree (task_id, role, sent_at DESC)"));
     database.drop().await;
 }
 
@@ -2342,8 +2398,7 @@ async fn populated_v34_forever_leaf_converts_without_rewriting_old_rows() {
             FOREVER_LEGACY_LEAF,
             TASK_HISTORY_FOREVER,
             &legacy.id_index_name,
-            &LeafBounds::new(legacy.lower_anchor, legacy.upper_anchor)
-                .expect("valid legacy bounds"),
+            LeafPartitionBoundExpectation::CatalogOnly,
             LeafIndexKind::History,
         )
         .await
@@ -2368,6 +2423,50 @@ async fn populated_v34_forever_leaf_converts_without_rewriting_old_rows() {
             .expect("rerun forever conversion"),
         0
     );
+    sqlx::query("ALTER TABLE horsies_tasks DROP CONSTRAINT horsies_tasks_live_status_only")
+        .execute(&mut *transaction)
+        .await
+        .expect("restore pre-cutover terminal live-row posture");
+    let relocation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO horsies_tasks (
+             id, task_name, queue_name, priority, args, kwargs, status,
+             sent_at, enqueued_at, completed_at, result, terminal_at,
+             terminalization_kind, retry_count, max_retries, enqueue_sha,
+             is_workflow_task, command_fingerprint_version,
+             command_fingerprint, retention_class_key, retain_rerun_input,
+             prepared_rerun_input_disposition, created_at, updated_at
+         ) VALUES (
+             $1, 'p3 legacy forever relocation', 'default', 100, '[]', '{}',
+             'COMPLETED', $2, $2, $2, NULL, $2, 'COMPLETE_LOCKED', 0, 0,
+             $1::text, FALSE, 1, $3, 'forever', FALSE, 'NEVER_ELIGIBLE',
+             $2, $2
+         )",
+    )
+    .bind(relocation_id)
+    .bind(old_anchor)
+    .bind(vec![7_u8; 32])
+    .execute(&mut *transaction)
+    .await
+    .expect("seed pre-today forever relocation task");
+    assert!(matches!(
+        relocate_terminal_batch(&mut transaction, 1)
+            .await
+            .expect("relocate into the MINVALUE legacy forever leaf"),
+        RelocationOutcome::Batch {
+            rows_relocated: 1,
+            ..
+        }
+    ));
+    let relocation_relation: String = sqlx::query_scalar(&format!(
+        "SELECT tableoid::regclass::text
+         FROM {TASK_HISTORY_PARENT} WHERE task_id = $1"
+    ))
+    .bind(relocation_id)
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("read relocated legacy forever row");
+    assert_eq!(relocation_relation, FOREVER_LEGACY_LEAF);
     let row_count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {TASK_HISTORY_PARENT} WHERE task_id = ANY($1)"
     ))

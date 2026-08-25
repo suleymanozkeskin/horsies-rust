@@ -15,7 +15,7 @@ use crate::core::history::names::{
 use crate::core::history::outcomes::{CatalogConflictKind, LeafCreation, LeafDrop, LeafInspection};
 use crate::core::history::partitions::catalog::{
     capture_partition_bound_utc, database_now, read_leaf_catalog_row, read_leaf_physical_state,
-    read_retention_class, LeafIndexKind, INDEX_SCHEMA_VERSION,
+    read_retention_class, LeafIndexKind, LeafPartitionBoundExpectation, INDEX_SCHEMA_VERSION,
 };
 use crate::core::history::partitions::locks::{
     try_lock_leaf_for_transaction, try_lock_relation_exclusive_for_transaction, LeafLockAttempt,
@@ -248,7 +248,7 @@ pub async fn create_hourly_heartbeat_leaf(
         catalog
             .as_ref()
             .map_or(index_name.as_str(), |row| row.id_index_name.as_str()),
-        leaf.bounds(),
+        LeafPartitionBoundExpectation::Requested(leaf.bounds()),
         LeafIndexKind::Heartbeat,
     )
     .await?;
@@ -402,7 +402,7 @@ async fn heartbeat_leaf_is_conformant(
         leaf.leaf_name(),
         HEARTBEATS_TABLE,
         &catalog.id_index_name,
-        leaf.bounds(),
+        LeafPartitionBoundExpectation::Requested(leaf.bounds()),
         LeafIndexKind::Heartbeat,
     )
     .await?;

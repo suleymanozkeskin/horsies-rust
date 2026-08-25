@@ -378,6 +378,15 @@ leaf_state AS (
                           WHERE attribute.attrelid = leaf.oid
                             AND attribute.attname = 'task_id'
                       )
+                      AND id_index.indcollation[0] = (
+                          SELECT attribute.attcollation
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'task_id'
+                      )
+                      AND pg_get_indexdef(id_index.indexrelid, 1, false) = 'task_id'
+                      AND pg_get_indexdef(id_index.indexrelid)
+                          LIKE '% USING btree (task_id)'
                       AND id_index.indoption[0] = 0
                   )
                   OR
@@ -403,6 +412,29 @@ leaf_state AS (
                           WHERE attribute.attrelid = leaf.oid
                             AND attribute.attname = 'sent_at'
                       )
+                      AND id_index.indcollation[0] = (
+                          SELECT attribute.attcollation
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'task_id'
+                      )
+                      AND id_index.indcollation[1] = (
+                          SELECT attribute.attcollation
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'role'
+                      )
+                      AND id_index.indcollation[2] = (
+                          SELECT attribute.attcollation
+                          FROM pg_attribute AS attribute
+                          WHERE attribute.attrelid = leaf.oid
+                            AND attribute.attname = 'sent_at'
+                      )
+                      AND pg_get_indexdef(id_index.indexrelid, 1, false) = 'task_id'
+                      AND pg_get_indexdef(id_index.indexrelid, 2, false) = 'role'
+                      AND pg_get_indexdef(id_index.indexrelid, 3, false) = 'sent_at'
+                      AND pg_get_indexdef(id_index.indexrelid)
+                          LIKE '% USING btree (task_id, role, sent_at DESC)'
                       AND id_index.indoption[0] = 0
                       AND id_index.indoption[1] = 0
                       AND id_index.indoption[2] = 3
@@ -436,6 +468,17 @@ leaf_state AS (
                       WHERE attribute.attrelid = leaf.oid
                         AND attribute.attname = 'enqueued_at'
                   )
+                  AND ordering_index.indcollation[0] = (
+                      SELECT attribute.attcollation
+                      FROM pg_attribute AS attribute
+                      WHERE attribute.attrelid = leaf.oid
+                        AND attribute.attname = 'enqueued_at'
+                  )
+                  AND pg_get_indexdef(
+                      ordering_index.indexrelid, 1, false
+                  ) = 'enqueued_at'
+                  AND pg_get_indexdef(ordering_index.indexrelid)
+                      LIKE '% USING btree (enqueued_at)'
                   AND ordering_index.indoption[0] = 0
             )
         ) AS leaf_conformant

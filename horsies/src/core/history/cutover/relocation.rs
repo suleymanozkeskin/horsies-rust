@@ -254,8 +254,7 @@ async fn attached_legacy_forever_upper(
         &catalog.leaf_name,
         &catalog.parent_name,
         &catalog.id_index_name,
-        &LeafBounds::new(catalog.lower_anchor, catalog.upper_anchor)
-            .map_err(|error| HistoryError::contract(error.to_string()))?,
+        crate::core::history::partitions::catalog::LeafPartitionBoundExpectation::CatalogOnly,
         crate::core::history::partitions::catalog::LeafIndexKind::History,
     )
     .await?;

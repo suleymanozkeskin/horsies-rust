@@ -75,6 +75,12 @@ pub enum LeafIndexKind {
     Heartbeat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafPartitionBoundExpectation<'a> {
+    Requested(&'a LeafBounds),
+    CatalogOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestLeafSelection {
     pub attached: Vec<LeafCatalogRow>,
@@ -341,7 +347,7 @@ pub async fn read_leaf_physical_state(
     leaf_name: &str,
     parent_name: &str,
     id_index_name: &str,
-    expected_bounds: &LeafBounds,
+    bound_expectation: LeafPartitionBoundExpectation<'_>,
     index_kind: LeafIndexKind,
 ) -> Result<LeafPhysicalState, HistoryError> {
     if [leaf_name, parent_name, id_index_name]
@@ -351,6 +357,12 @@ pub async fn read_leaf_physical_state(
         return Err(HistoryError::contract("unsafe physical-state identifier"));
     }
     let heartbeat_index = matches!(index_kind, LeafIndexKind::Heartbeat);
+    let (expected_lower, expected_upper) = match bound_expectation {
+        LeafPartitionBoundExpectation::Requested(bounds) => {
+            (Some(bounds.lower()), Some(bounds.upper()))
+        }
+        LeafPartitionBoundExpectation::CatalogOnly => (None, None),
+    };
     let prior = pin_utc_timezone(connection).await?;
     let result = sqlx::query_as::<_, PhysicalRaw>(
         "WITH selected_index AS MATERIALIZED (
@@ -368,12 +380,13 @@ pub async fn read_leaf_physical_state(
                  FROM pg_class AS relation
                  WHERE relation.oid = to_regclass($1)) AS partition_bound,
                 COALESCE((
-                    SELECT pg_get_expr(relation.relpartbound, relation.oid) =
-                        format(
-                            'FOR VALUES FROM (%L) TO (%L)',
-                            $4::timestamptz,
-                            $5::timestamptz
-                        )
+                    SELECT $4::timestamptz IS NULL
+                        OR pg_get_expr(relation.relpartbound, relation.oid) =
+                            format(
+                                'FOR VALUES FROM (%L) TO (%L)',
+                                $4::timestamptz,
+                                $5::timestamptz
+                            )
                     FROM pg_class AS relation
                     WHERE relation.oid = to_regclass($1)
                 ), false) AS partition_bound_matches_expected,
@@ -405,6 +418,17 @@ pub async fn read_leaf_physical_state(
                                   WHERE attribute.attrelid = to_regclass($1)
                                     AND attribute.attname = 'task_id'
                               )
+                              AND selected_index.indcollation[0] = (
+                                  SELECT attribute.attcollation
+                                  FROM pg_attribute AS attribute
+                                  WHERE attribute.attrelid = to_regclass($1)
+                                    AND attribute.attname = 'task_id'
+                              )
+                              AND pg_get_indexdef(
+                                  selected_index.indexrelid, 1, false
+                              ) = 'task_id'
+                              AND pg_get_indexdef(selected_index.indexrelid)
+                                  LIKE '% USING btree (task_id)'
                               AND selected_index.indoption[0] = 0
                           )
                           OR
@@ -430,6 +454,35 @@ pub async fn read_leaf_physical_state(
                                   WHERE attribute.attrelid = to_regclass($1)
                                     AND attribute.attname = 'sent_at'
                               )
+                              AND selected_index.indcollation[0] = (
+                                  SELECT attribute.attcollation
+                                  FROM pg_attribute AS attribute
+                                  WHERE attribute.attrelid = to_regclass($1)
+                                    AND attribute.attname = 'task_id'
+                              )
+                              AND selected_index.indcollation[1] = (
+                                  SELECT attribute.attcollation
+                                  FROM pg_attribute AS attribute
+                                  WHERE attribute.attrelid = to_regclass($1)
+                                    AND attribute.attname = 'role'
+                              )
+                              AND selected_index.indcollation[2] = (
+                                  SELECT attribute.attcollation
+                                  FROM pg_attribute AS attribute
+                                  WHERE attribute.attrelid = to_regclass($1)
+                                    AND attribute.attname = 'sent_at'
+                              )
+                              AND pg_get_indexdef(
+                                  selected_index.indexrelid, 1, false
+                              ) = 'task_id'
+                              AND pg_get_indexdef(
+                                  selected_index.indexrelid, 2, false
+                              ) = 'role'
+                              AND pg_get_indexdef(
+                                  selected_index.indexrelid, 3, false
+                              ) = 'sent_at'
+                              AND pg_get_indexdef(selected_index.indexrelid)
+                                  LIKE '% USING btree (task_id, role, sent_at DESC)'
                               AND selected_index.indoption[0] = 0
                               AND selected_index.indoption[1] = 0
                               AND selected_index.indoption[2] = 3
@@ -443,8 +496,8 @@ pub async fn read_leaf_physical_state(
     .bind(leaf_name)
     .bind(parent_name)
     .bind(id_index_name)
-    .bind(expected_bounds.lower())
-    .bind(expected_bounds.upper())
+    .bind(expected_lower)
+    .bind(expected_upper)
     .bind(heartbeat_index)
     .fetch_one(&mut *connection)
     .await;
@@ -491,6 +544,13 @@ pub async fn read_leaf_ordering_index_exists(
                    SELECT a.attnum FROM pg_attribute AS a
                    WHERE a.attrelid = to_regclass($1) AND a.attname = $2
                )
+               AND i.indcollation[0] = (
+                   SELECT a.attcollation FROM pg_attribute AS a
+                   WHERE a.attrelid = to_regclass($1) AND a.attname = $2
+               )
+               AND pg_get_indexdef(i.indexrelid, 1, false) = $2
+               AND pg_get_indexdef(i.indexrelid)
+                   LIKE '% USING btree (enqueued_at)'
                AND i.indoption[0] = 0
          )",
     )

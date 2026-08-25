@@ -28,7 +28,7 @@ use crate::core::history::outcomes::{
 use super::catalog::{
     capture_partition_bound_utc, database_now, read_leaf_catalog_row,
     read_leaf_ordering_index_exists, read_leaf_physical_state, read_retention_class, LeafIndexKind,
-    RetentionClassRow, INDEX_SCHEMA_VERSION,
+    LeafPartitionBoundExpectation, RetentionClassRow, INDEX_SCHEMA_VERSION,
 };
 use super::locks::{
     is_lock_not_available, try_lock_leaf_for_session, try_lock_leaf_for_transaction,
@@ -202,7 +202,7 @@ pub async fn inspect_leaf(
         leaf.leaf_name(),
         parent_name,
         &id_index_name,
-        leaf.bounds(),
+        LeafPartitionBoundExpectation::Requested(leaf.bounds()),
         match leaf.class_key() {
             HEARTBEAT_CLASS_KEY => LeafIndexKind::Heartbeat,
             _ => LeafIndexKind::History,
@@ -392,7 +392,7 @@ pub async fn create_daily_leaf<P: LoaderPublication>(
         leaf.leaf_name(),
         &parent_name,
         &id_index_name,
-        leaf.bounds(),
+        LeafPartitionBoundExpectation::Requested(leaf.bounds()),
         LeafIndexKind::History,
     )
     .await?;
@@ -580,7 +580,7 @@ async fn daily_leaf_is_conformant(
         leaf.leaf_name(),
         parent_name,
         &catalog.id_index_name,
-        leaf.bounds(),
+        LeafPartitionBoundExpectation::Requested(leaf.bounds()),
         LeafIndexKind::History,
     )
     .await?;
