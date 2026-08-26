@@ -85,6 +85,49 @@ fn root_shared_buffers(plan: &serde_json::Value) -> u64 {
         .sum()
 }
 
+fn relation_rows_examined(plan: &serde_json::Value, relation: &str) -> f64 {
+    match plan {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| relation_rows_examined(value, relation))
+            .sum(),
+        serde_json::Value::Object(fields) => {
+            let current = if fields
+                .get("Relation Name")
+                .and_then(serde_json::Value::as_str)
+                == Some(relation)
+            {
+                let rows = [
+                    "Actual Rows",
+                    "Rows Removed by Filter",
+                    "Rows Removed by Index Recheck",
+                ]
+                .into_iter()
+                .map(|field| {
+                    fields
+                        .get(field)
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0)
+                })
+                .sum::<f64>();
+                let loops = fields
+                    .get("Actual Loops")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                rows * loops
+            } else {
+                0.0
+            };
+            current
+                + fields
+                    .values()
+                    .map(|value| relation_rows_examined(value, relation))
+                    .sum::<f64>()
+        }
+        _ => 0.0,
+    }
+}
+
 fn test_db_url() -> String {
     if let Ok(url) = std::env::var("DATABASE_URL") {
         return url;
@@ -1942,35 +1985,138 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
     );
     explain_transaction.rollback().await.unwrap();
 
+    let mut discovery_transaction = pool.begin().await.unwrap();
     let plan: serde_json::Value = sqlx::query_scalar(
-        "EXPLAIN (FORMAT JSON)
-         WITH scanned AS MATERIALIZED (
-             SELECT created_at, id FROM horsies_tasks
-             WHERE is_workflow_task = TRUE
-               AND status IN ('CLAIMED', 'PENDING')
-             ORDER BY created_at, id LIMIT 500
-         )
-         SELECT candidate.id
-         FROM scanned s
-         CROSS JOIN LATERAL (
-             SELECT t.id
-             FROM horsies_tasks t
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+         WITH cursor_row AS MATERIALIZED (
+             SELECT last_created_at, last_id,
+                    cycle_upper_created_at, cycle_upper_id
+             FROM horsies_recovery_scan_cursors
+             WHERE scan_name = 'orphan_workflow_tasks'
+             FOR UPDATE NOWAIT
+         ),
+         upper_bound AS MATERIALIZED (
+             SELECT COALESCE(c.cycle_upper_created_at, latest.created_at) AS created_at,
+                    COALESCE(c.cycle_upper_id, latest.id) AS id
+             FROM cursor_row c
              LEFT JOIN LATERAL (
-                 SELECT TRUE AS found
-                 FROM horsies_workflow_tasks wt
-                 WHERE wt.task_id = t.id
-                   AND wt.status IN ('ENQUEUED', 'READY', 'PENDING', 'RUNNING')
+                 SELECT t.created_at, t.id
+                 FROM horsies_tasks t
+                 WHERE c.cycle_upper_id IS NULL
+                   AND t.is_workflow_task = TRUE
+                   AND t.status IN ('CLAIMED', 'PENDING')
+                 ORDER BY t.created_at DESC, t.id DESC
                  LIMIT 1
-             ) runnable_link ON TRUE
-             WHERE t.id = s.id
-               AND t.is_workflow_task = TRUE
-               AND t.status IN ('CLAIMED', 'PENDING')
-               AND runnable_link.found IS NULL
-             LIMIT 1
-             FOR UPDATE OF t SKIP LOCKED
-         ) candidate",
+             ) latest ON TRUE
+         ),
+         scanned AS MATERIALIZED (
+             SELECT page.created_at, page.id
+             FROM cursor_row c
+             CROSS JOIN upper_bound u
+             CROSS JOIN LATERAL (
+                 SELECT bounded.created_at, bounded.id
+                 FROM (
+                     (
+                         SELECT t.created_at, t.id
+                         FROM horsies_tasks t
+                         WHERE c.last_id IS NULL
+                           AND t.is_workflow_task = TRUE
+                           AND t.status IN ('CLAIMED', 'PENDING')
+                           AND u.id IS NOT NULL
+                           AND (t.created_at, t.id) <= (u.created_at, u.id)
+                         ORDER BY t.created_at, t.id
+                         LIMIT CAST($1 AS integer)
+                     )
+                     UNION ALL
+                     (
+                         SELECT t.created_at, t.id
+                         FROM horsies_tasks t
+                         WHERE c.last_id IS NOT NULL
+                           AND t.is_workflow_task = TRUE
+                           AND t.status IN ('CLAIMED', 'PENDING')
+                           AND u.id IS NOT NULL
+                           AND (t.created_at, t.id)
+                               > (c.last_created_at, c.last_id)
+                           AND (t.created_at, t.id) <= (u.created_at, u.id)
+                         ORDER BY t.created_at, t.id
+                         LIMIT CAST($1 AS integer)
+                     )
+                 ) bounded
+                 ORDER BY bounded.created_at, bounded.id
+                 LIMIT CAST($1 AS integer)
+             ) page
+         ),
+         scan_summary AS MATERIALIZED (
+             SELECT count(*)::integer AS scan_count,
+                    array_agg(created_at ORDER BY created_at, id) AS scan_created_at,
+                    array_agg(id ORDER BY created_at, id) AS scan_ids
+             FROM scanned
+         ),
+         candidates AS MATERIALIZED (
+             SELECT candidate.id
+             FROM scan_summary summary
+             CROSS JOIN LATERAL
+                  unnest(COALESCE(summary.scan_ids, '{}'::uuid[])) AS scanned(id)
+             CROSS JOIN LATERAL (
+                 SELECT t.id
+                 FROM horsies_tasks t
+                 LEFT JOIN LATERAL (
+                     SELECT TRUE AS found
+                     FROM horsies_workflow_tasks wt
+                     WHERE wt.task_id = t.id
+                       AND wt.status IN ('ENQUEUED', 'READY', 'PENDING', 'RUNNING')
+                     LIMIT 1
+                 ) runnable_link ON TRUE
+                 WHERE t.id = scanned.id
+                   AND t.is_workflow_task = TRUE
+                   AND t.status IN ('CLAIMED', 'PENDING')
+                   AND runnable_link.found IS NULL
+                 LIMIT 1
+                 FOR UPDATE OF t SKIP LOCKED
+             ) candidate
+         ),
+         candidate_summary AS MATERIALIZED (
+             SELECT COALESCE(array_agg(id ORDER BY id), '{}'::uuid[]) AS ids
+             FROM candidates
+         ),
+         progress AS MATERIALIZED (
+             SELECT summary.scan_count, summary.scan_created_at, summary.scan_ids,
+                    candidates.ids, u.created_at AS upper_created_at, u.id AS upper_id,
+                    summary.scan_count < CAST($1 AS integer)
+                        OR (
+                            summary.scan_count > 0
+                            AND (
+                                summary.scan_created_at[summary.scan_count],
+                                summary.scan_ids[summary.scan_count]
+                            ) = (u.created_at, u.id)
+                        ) AS cycle_complete
+             FROM scan_summary summary
+             CROSS JOIN candidate_summary candidates
+             CROSS JOIN upper_bound u
+         ),
+         advance AS (
+             UPDATE horsies_recovery_scan_cursors cursor
+             SET last_created_at = CASE WHEN progress.cycle_complete THEN NULL
+                                        ELSE progress.scan_created_at[progress.scan_count] END,
+                 last_id = CASE WHEN progress.cycle_complete THEN NULL
+                                ELSE progress.scan_ids[progress.scan_count] END,
+                 cycle_upper_created_at = CASE WHEN progress.cycle_complete THEN NULL
+                                               ELSE progress.upper_created_at END,
+                 cycle_upper_id = CASE WHEN progress.cycle_complete THEN NULL
+                                       ELSE progress.upper_id END,
+                 completed_cycles = completed_cycles
+                     + CASE WHEN progress.cycle_complete THEN 1 ELSE 0 END,
+                 last_scan_rows = progress.scan_count,
+                 last_candidate_rows = cardinality(progress.ids),
+                 last_scan_at = statement_timestamp()
+             FROM progress
+             WHERE cursor.scan_name = 'orphan_workflow_tasks'
+             RETURNING progress.scan_count, progress.ids
+         )
+         SELECT * FROM advance",
     )
-    .fetch_one(&pool)
+    .bind(500_i32)
+    .fetch_one(discovery_transaction.as_mut())
     .await
     .unwrap();
     assert!(
@@ -1987,6 +2133,15 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
             && !plan_has_sequential_scan(&plan, "horsies_workflow_tasks"),
         "orphan audit must not scan complete task tables: {plan}",
     );
+    assert!(
+        relation_rows_examined(&plan, "horsies_tasks") <= 1_001.0,
+        "orphan audit must examine one task page, one upper bound, and one identity probe per page row: {plan}",
+    );
+    assert!(
+        relation_rows_examined(&plan, "horsies_workflow_tasks") <= 500.0,
+        "orphan audit must use at most one workflow-task probe per page row: {plan}",
+    );
+    discovery_transaction.rollback().await.unwrap();
 
     let mut found = false;
     for _ in 0..100 {

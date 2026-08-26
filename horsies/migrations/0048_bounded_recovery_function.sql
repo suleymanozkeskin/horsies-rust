@@ -195,23 +195,36 @@ BEGIN
         LIMIT 1;
     END IF;
 
-    SELECT array_agg(s.created_at ORDER BY s.created_at, s.id),
-           array_agg(s.id ORDER BY s.created_at, s.id)
-    INTO v_scan_created_at, v_scan_ids
-    FROM (
-        SELECT t.created_at, t.id
-        FROM horsies_tasks t
-        WHERE t.is_workflow_task = TRUE
-          AND t.status IN ('CLAIMED', 'PENDING')
-          AND v_upper_id IS NOT NULL
-          AND (
-              v_cursor_id IS NULL
-              OR (t.created_at, t.id) > (v_cursor_created_at, v_cursor_id)
-          )
-          AND (t.created_at, t.id) <= (v_upper_created_at, v_upper_id)
-        ORDER BY t.created_at, t.id
-        LIMIT p_batch_size
-    ) s;
+    IF v_cursor_id IS NULL THEN
+        SELECT array_agg(s.created_at ORDER BY s.created_at, s.id),
+               array_agg(s.id ORDER BY s.created_at, s.id)
+        INTO v_scan_created_at, v_scan_ids
+        FROM (
+            SELECT t.created_at, t.id
+            FROM horsies_tasks t
+            WHERE t.is_workflow_task = TRUE
+              AND t.status IN ('CLAIMED', 'PENDING')
+              AND v_upper_id IS NOT NULL
+              AND (t.created_at, t.id) <= (v_upper_created_at, v_upper_id)
+            ORDER BY t.created_at, t.id
+            LIMIT p_batch_size
+        ) s;
+    ELSE
+        SELECT array_agg(s.created_at ORDER BY s.created_at, s.id),
+               array_agg(s.id ORDER BY s.created_at, s.id)
+        INTO v_scan_created_at, v_scan_ids
+        FROM (
+            SELECT t.created_at, t.id
+            FROM horsies_tasks t
+            WHERE t.is_workflow_task = TRUE
+              AND t.status IN ('CLAIMED', 'PENDING')
+              AND v_upper_id IS NOT NULL
+              AND (t.created_at, t.id) > (v_cursor_created_at, v_cursor_id)
+              AND (t.created_at, t.id) <= (v_upper_created_at, v_upper_id)
+            ORDER BY t.created_at, t.id
+            LIMIT p_batch_size
+        ) s;
+    END IF;
     v_scan_count := COALESCE(cardinality(v_scan_ids), 0);
     v_cycle_complete := v_scan_count < p_batch_size
         OR (

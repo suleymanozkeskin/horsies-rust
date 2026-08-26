@@ -1051,49 +1051,44 @@ async fn run_reaper_pass(
                         }),
                     );
                 }
-                Err(e) if e.is_retryable() => {
-                    orphan_state.permanent_failures = 0;
-                    health.write().await.orphan_task_recovery = Some(serde_json::json!({
-                        "state": "refused",
-                        "rows_selected": 0,
-                        "candidates_returned": 0,
-                        "cancelled": 0,
-                        "duration_ms": elapsed_millis(started),
-                        "refusals": 1,
-                        "errors": 0,
-                        "error": e.to_string(),
-                    }));
-                    tracing::warn!(
-                        error = %e,
-                        "reaper orphan audit was refused and will retry on its next schedule",
-                    );
-                }
-                Err(e) => {
-                    orphan_state.permanent_failures += 1;
-                    health.write().await.orphan_task_recovery = Some(serde_json::json!({
-                        "state": "error",
-                        "rows_selected": 0,
-                        "candidates_returned": 0,
-                        "cancelled": 0,
-                        "duration_ms": elapsed_millis(started),
-                        "refusals": 0,
-                        "errors": 1,
-                        "error": e.to_string(),
-                    }));
-                    if orphan_state.permanent_failures >= ORPHAN_SWEEP_MAX_PERMANENT_FAILURES {
-                        orphan_state.disabled = true;
-                        tracing::error!(
-                            error = %e,
-                            failures = orphan_state.permanent_failures,
-                            "reaper orphan audit disabled after consecutive permanent failures",
-                        );
-                    } else {
-                        tracing::error!(
-                            error = %e,
-                            failures = orphan_state.permanent_failures,
-                            max = ORPHAN_SWEEP_MAX_PERMANENT_FAILURES,
-                            "reaper orphan audit failed",
-                        );
+                Err(error) => {
+                    let (kind, snapshot) = orphan_audit_failure_snapshot(&error, started);
+                    health.write().await.orphan_task_recovery = Some(snapshot);
+                    match kind {
+                        OrphanAuditFailureKind::Refusal => {
+                            orphan_state.permanent_failures = 0;
+                            tracing::warn!(
+                                %error,
+                                "reaper orphan audit lock was refused and will retry on its next schedule",
+                            );
+                        }
+                        OrphanAuditFailureKind::Transient => {
+                            orphan_state.permanent_failures = 0;
+                            tracing::error!(
+                                %error,
+                                "reaper orphan audit failed transiently and will retry on its next schedule",
+                            );
+                        }
+                        OrphanAuditFailureKind::Permanent => {
+                            orphan_state.permanent_failures += 1;
+                            if orphan_state.permanent_failures
+                                >= ORPHAN_SWEEP_MAX_PERMANENT_FAILURES
+                            {
+                                orphan_state.disabled = true;
+                                tracing::error!(
+                                    %error,
+                                    failures = orphan_state.permanent_failures,
+                                    "reaper orphan audit disabled after consecutive permanent failures",
+                                );
+                            } else {
+                                tracing::error!(
+                                    %error,
+                                    failures = orphan_state.permanent_failures,
+                                    max = ORPHAN_SWEEP_MAX_PERMANENT_FAILURES,
+                                    "reaper orphan audit failed",
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1537,6 +1532,19 @@ mod orphan_audit_schedule_tests {
         assert!(!state.schedule_if_due(now + Duration::from_secs(59), interval));
         assert!(state.schedule_if_due(now + Duration::from_secs(60), interval));
     }
+
+    #[test]
+    fn transient_non_lock_failure_is_an_error_in_the_health_snapshot() {
+        let error = crate::broker::BrokerError::Database(sqlx::Error::PoolTimedOut);
+        let (kind, snapshot) = orphan_audit_failure_snapshot(&error, std::time::Instant::now());
+
+        assert_eq!(kind, OrphanAuditFailureKind::Transient);
+        assert_eq!(snapshot["state"], "error");
+        assert_eq!(snapshot["rows_selected"], 0);
+        assert_eq!(snapshot["candidates_returned"], 0);
+        assert_eq!(snapshot["refusals"], 0);
+        assert_eq!(snapshot["errors"], 1);
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1548,6 +1556,41 @@ struct OrphanTaskAuditReport {
     duration_ms: u64,
     refusals: u32,
     errors: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanAuditFailureKind {
+    Refusal,
+    Transient,
+    Permanent,
+}
+
+fn orphan_audit_failure_snapshot(
+    error: &crate::broker::BrokerError,
+    started: std::time::Instant,
+) -> (OrphanAuditFailureKind, serde_json::Value) {
+    let kind = match (error.is_lock_not_available(), error.is_retryable()) {
+        (true, _) => OrphanAuditFailureKind::Refusal,
+        (false, true) => OrphanAuditFailureKind::Transient,
+        (false, false) => OrphanAuditFailureKind::Permanent,
+    };
+    let (state, refusals, errors) = match kind {
+        OrphanAuditFailureKind::Refusal => ("refused", 1, 0),
+        OrphanAuditFailureKind::Transient | OrphanAuditFailureKind::Permanent => ("error", 0, 1),
+    };
+    (
+        kind,
+        serde_json::json!({
+            "state": state,
+            "rows_selected": 0,
+            "candidates_returned": 0,
+            "cancelled": 0,
+            "duration_ms": elapsed_millis(started),
+            "refusals": refusals,
+            "errors": errors,
+            "error": error.to_string(),
+        }),
+    )
 }
 
 #[derive(sqlx::FromRow)]

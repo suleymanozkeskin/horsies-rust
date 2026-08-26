@@ -82,6 +82,16 @@ pub enum BrokerError {
 }
 
 impl BrokerError {
+    /// Whether this error is PostgreSQL's nonblocking lock refusal.
+    pub fn is_lock_not_available(&self) -> bool {
+        match self {
+            Self::Database(sqlx::Error::Database(error)) => {
+                error.code().is_some_and(|code| code.as_ref() == "55P03")
+            }
+            _ => false,
+        }
+    }
+
     /// Whether this error is transient and the operation can be retried.
     ///
     /// Retryable: `Database` (when the underlying sqlx error is retryable),

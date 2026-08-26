@@ -60,6 +60,35 @@ const ADVISORY_LOCK_KEY: i64 = 0x484F_5253_4945_5300;
 const MIGRATION_MAX_ATTEMPTS: usize = 5;
 const DEADLOCK_SQLSTATE: &str = "40P01";
 
+#[derive(Clone, Copy)]
+struct ConcurrentRecoveryIndex {
+    version: i64,
+    name: &'static str,
+    table: &'static str,
+    drop_sql: &'static str,
+}
+
+const CONCURRENT_RECOVERY_INDEXES: [ConcurrentRecoveryIndex; 2] = [
+    ConcurrentRecoveryIndex {
+        version: 46,
+        name: "idx_horsies_workflows_running_recovery_scan",
+        table: "horsies_workflows",
+        drop_sql: "DROP INDEX CONCURRENTLY idx_horsies_workflows_running_recovery_scan",
+    },
+    ConcurrentRecoveryIndex {
+        version: 47,
+        name: "idx_horsies_tasks_orphan_recovery_scan",
+        table: "horsies_tasks",
+        drop_sql: "DROP INDEX CONCURRENTLY idx_horsies_tasks_orphan_recovery_scan",
+    },
+];
+
+enum RecoveryIndexRelationState {
+    Absent,
+    ExpectedTable,
+    Conflict,
+}
+
 /// Run all embedded horsies migrations against `pool`.
 ///
 /// Bookkeeps in [`MIGRATIONS_TABLE`] rather than `_sqlx_migrations`.
@@ -365,6 +394,12 @@ async fn apply_migration(
     let start = Instant::now();
 
     if migration.no_tx {
+        if let Some(index) = CONCURRENT_RECOVERY_INDEXES
+            .iter()
+            .find(|index| index.version == migration.version)
+        {
+            prepare_concurrent_recovery_index(conn, migration, *index).await?;
+        }
         execute_sql(&mut *conn, migration).await?;
         record_applied(&mut *conn, migration).await?;
     } else {
@@ -386,6 +421,51 @@ async fn apply_migration(
     .await?;
 
     Ok(())
+}
+
+async fn prepare_concurrent_recovery_index(
+    conn: &mut PgConnection,
+    migration: &Migration,
+    index: ConcurrentRecoveryIndex,
+) -> Result<(), BrokerError> {
+    let relation_owner: Option<(Option<bool>,)> = sqlx::query_as(
+        "SELECT i.indrelid = to_regclass($2)
+         FROM pg_class AS c
+         LEFT JOIN pg_index AS i ON i.indexrelid = c.oid
+         WHERE c.oid = to_regclass($1)",
+    )
+    .bind(index.name)
+    .bind(index.table)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let state = match relation_owner {
+        None => RecoveryIndexRelationState::Absent,
+        Some((Some(true),)) => RecoveryIndexRelationState::ExpectedTable,
+        Some((Some(false) | None,)) => RecoveryIndexRelationState::Conflict,
+    };
+
+    match state {
+        RecoveryIndexRelationState::Absent => Ok(()),
+        RecoveryIndexRelationState::ExpectedTable => {
+            sqlx::query(index.drop_sql)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| {
+                    BrokerError::Migration(MigrateError::ExecuteMigration(error, migration.version))
+                })?;
+            Ok(())
+        }
+        RecoveryIndexRelationState::Conflict => {
+            let error = sqlx::Error::Protocol(format!(
+                "migration {} requires index {} on {}, but that name belongs to another relation",
+                migration.version, index.name, index.table,
+            ));
+            Err(BrokerError::Migration(MigrateError::ExecuteMigration(
+                error,
+                migration.version,
+            )))
+        }
+    }
 }
 
 async fn execute_sql<'c, E>(executor: E, migration: &Migration) -> Result<(), BrokerError>
@@ -420,6 +500,15 @@ where
 
 #[cfg(test)]
 mod recovery_index_migration_tests {
+    use std::str::FromStr;
+
+    use serial_test::serial;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx::{Connection, PgConnection};
+    use uuid::Uuid;
+
+    use super::*;
+
     const WORKFLOW_INDEX: &str =
         include_str!("../../migrations/0046_running_workflow_recovery_index.sql");
     const TASK_INDEX: &str = include_str!("../../migrations/0047_orphan_task_recovery_index.sql");
@@ -430,7 +519,8 @@ mod recovery_index_migration_tests {
     fn recovery_indexes_are_concurrent_and_validated_before_function_install() {
         for migration in [WORKFLOW_INDEX, TASK_INDEX] {
             assert!(migration.starts_with("-- no-transaction\n"));
-            assert!(migration.contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
+            assert!(migration.contains("CREATE INDEX CONCURRENTLY"));
+            assert!(!migration.contains("IF NOT EXISTS"));
         }
         let validation = VALIDATION_AND_FUNCTION
             .find("DO $migration$")
@@ -449,5 +539,124 @@ mod recovery_index_migration_tests {
         ] {
             assert!(VALIDATION_AND_FUNCTION.contains(required_shape_check));
         }
+    }
+
+    fn test_db_url() -> String {
+        if let Ok(url) = std::env::var("DATABASE_URL") {
+            return url;
+        }
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let root = std::path::Path::new(manifest_dir)
+            .ancestors()
+            .find(|path| path.join(".env").exists());
+        let password = root
+            .and_then(|path| std::fs::read_to_string(path.join(".env")).ok())
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| line.trim().split_once('='))
+                    .find(|(key, _)| key.trim() == "DB_PASSWORD")
+                    .map(|(_, value)| value.trim().to_owned())
+            })
+            .unwrap_or_else(|| "W0rklane".to_owned());
+        format!("postgresql://postgres:{password}@localhost:5432/horsies-rust-port")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn invalid_concurrent_recovery_index_is_rebuilt_on_migration_retry() {
+        let base_options = PgConnectOptions::from_str(&test_db_url()).unwrap();
+        let mut admin = PgConnection::connect_with(&base_options.clone().database("postgres"))
+            .await
+            .unwrap();
+        let database_name = format!("horsies_migration_retry_{}", Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE \"{database_name}\""))
+            .execute(&mut admin)
+            .await
+            .unwrap();
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(base_options.database(&database_name))
+            .await
+            .unwrap();
+
+        run_horsies_migrations_through(&pool, 45).await.unwrap();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO horsies_workflows (
+                 id, name, status, on_error, definition_key, depth,
+                 root_workflow_id, sent_at, created_at, started_at, updated_at
+             ) VALUES
+                 ($1, 'migration_retry_a', 'RUNNING', 'fail', $3, 0,
+                  $1, NOW(), NOW(), NOW(), NOW()),
+                 ($2, 'migration_retry_b', 'RUNNING', 'fail', $4, 0,
+                  $2, NOW(), NOW(), NOW(), NOW())",
+        )
+        .bind(first_id)
+        .bind(second_id)
+        .bind(format!("test.migration-retry.{first_id}"))
+        .bind(format!("test.migration-retry.{second_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let build_error = sqlx::query(
+            "CREATE UNIQUE INDEX CONCURRENTLY
+                 idx_horsies_workflows_running_recovery_scan
+             ON horsies_workflows (status)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            build_error
+                .as_database_error()
+                .and_then(|error| error.code().map(|code| code.into_owned()))
+                .as_deref(),
+            Some("23505"),
+        );
+        let invalid: bool = sqlx::query_scalar(
+            "SELECT NOT i.indisvalid
+             FROM pg_index AS i
+             WHERE i.indexrelid =
+                   'idx_horsies_workflows_running_recovery_scan'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            invalid,
+            "failed concurrent build must leave an invalid index"
+        );
+
+        run_horsies_migrations_through(&pool, 48).await.unwrap();
+        let valid: bool = sqlx::query_scalar(
+            "SELECT i.indisvalid AND i.indisready AND i.indislive
+             FROM pg_index AS i
+             WHERE i.indexrelid =
+                   'idx_horsies_workflows_running_recovery_scan'::regclass
+               AND i.indrelid = 'horsies_workflows'::regclass",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(valid, "migration retry must install a valid recovery index");
+        let applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM horsies_migrations
+                 WHERE version = 46 AND success
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(applied, "repaired index migration must be recorded");
+
+        pool.close().await;
+        sqlx::query(&format!("DROP DATABASE \"{database_name}\""))
+            .execute(&mut admin)
+            .await
+            .unwrap();
     }
 }

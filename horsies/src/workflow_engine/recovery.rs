@@ -255,25 +255,45 @@ upper_bound AS MATERIALIZED (
     LEFT JOIN LATERAL (
         SELECT w.created_at, w.id
         FROM horsies_workflows w
-        WHERE w.status = 'RUNNING'
+        WHERE c.cycle_upper_id IS NULL
+          AND w.status = 'RUNNING'
         ORDER BY w.created_at DESC, w.id DESC
         LIMIT 1
-    ) latest ON c.cycle_upper_id IS NULL
+    ) latest ON TRUE
 ),
 scanned AS MATERIALIZED (
-    SELECT w.created_at, w.id, w.name
-    FROM horsies_workflows w
-    CROSS JOIN cursor_row c
+    SELECT page.created_at, page.id, page.name
+    FROM cursor_row c
     CROSS JOIN upper_bound u
-    WHERE w.status = 'RUNNING'
-      AND u.id IS NOT NULL
-      AND (
-          c.last_id IS NULL
-          OR (w.created_at, w.id) > (c.last_created_at, c.last_id)
-      )
-      AND (w.created_at, w.id) <= (u.created_at, u.id)
-    ORDER BY w.created_at, w.id
-    LIMIT CAST($1 AS bigint)
+    CROSS JOIN LATERAL (
+        SELECT bounded.created_at, bounded.id, bounded.name
+        FROM (
+            (
+                SELECT w.created_at, w.id, w.name
+                FROM horsies_workflows w
+                WHERE c.last_id IS NULL
+                  AND w.status = 'RUNNING'
+                  AND u.id IS NOT NULL
+                  AND (w.created_at, w.id) <= (u.created_at, u.id)
+                ORDER BY w.created_at, w.id
+                LIMIT CAST($1 AS bigint)
+            )
+            UNION ALL
+            (
+                SELECT w.created_at, w.id, w.name
+                FROM horsies_workflows w
+                WHERE c.last_id IS NOT NULL
+                  AND w.status = 'RUNNING'
+                  AND u.id IS NOT NULL
+                  AND (w.created_at, w.id) > (c.last_created_at, c.last_id)
+                  AND (w.created_at, w.id) <= (u.created_at, u.id)
+                ORDER BY w.created_at, w.id
+                LIMIT CAST($1 AS bigint)
+            )
+        ) bounded
+        ORDER BY bounded.created_at, bounded.id
+        LIMIT CAST($1 AS bigint)
+    ) page
 ),
 classified AS MATERIALIZED (
     SELECT s.created_at, s.id, s.name,
@@ -1636,6 +1656,49 @@ mod cap_tests {
             .sum()
     }
 
+    fn relation_rows_examined(plan: &serde_json::Value, relation: &str) -> f64 {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .map(|value| relation_rows_examined(value, relation))
+                .sum(),
+            serde_json::Value::Object(fields) => {
+                let current = if fields
+                    .get("Relation Name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(relation)
+                {
+                    let rows = [
+                        "Actual Rows",
+                        "Rows Removed by Filter",
+                        "Rows Removed by Index Recheck",
+                    ]
+                    .into_iter()
+                    .map(|field| {
+                        fields
+                            .get(field)
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0)
+                    })
+                    .sum::<f64>();
+                    let loops = fields
+                        .get("Actual Loops")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0);
+                    rows * loops
+                } else {
+                    0.0
+                };
+                current
+                    + fields
+                        .values()
+                        .map(|value| relation_rows_examined(value, relation))
+                        .sum::<f64>()
+            }
+            _ => 0.0,
+        }
+    }
+
     async fn insert_orphaned_workflow(pool: &PgPool, id: Uuid) {
         sqlx::query(
             "INSERT INTO horsies_workflows (
@@ -2028,6 +2091,14 @@ mod cap_tests {
         assert!(
             root_shared_buffers(&plan) <= 10_000,
             "bounded workflow audit must stay within its physical buffer budget: {plan}",
+        );
+        assert!(
+            relation_rows_examined(&plan, "horsies_workflows") <= 201.0,
+            "bounded workflow audit must examine no more than one workflow page and its upper bound: {plan}",
+        );
+        assert!(
+            relation_rows_examined(&plan, "horsies_workflow_tasks") <= 400.0,
+            "bounded workflow audit must use at most two task probes per workflow: {plan}",
         );
         explain_transaction.rollback().await.unwrap();
 
