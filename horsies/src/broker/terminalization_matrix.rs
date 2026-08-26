@@ -154,6 +154,57 @@ struct P5TestDatabase {
     _anchor: PgPool,
 }
 
+struct IsolatedTerminalizationTestDatabase {
+    admin: PgConnection,
+    pool: PgPool,
+    name: String,
+}
+
+impl IsolatedTerminalizationTestDatabase {
+    async fn create() -> Self {
+        let base_options = PgConnectOptions::from_str(&test_db_url())
+            .expect("invalid terminalization database URL");
+        let mut admin = PgConnection::connect_with(&base_options.clone().database("postgres"))
+            .await
+            .expect("connect to terminalization admin database");
+        let name = format!(
+            "horsies_terminalization_isolated_{}",
+            Uuid::new_v4().simple()
+        );
+        sqlx::query(&format!("CREATE DATABASE \"{name}\""))
+            .execute(&mut admin)
+            .await
+            .expect("create isolated terminalization database");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(base_options.database(&name))
+            .await
+            .expect("connect isolated terminalization database");
+        run_horsies_migrations(&pool)
+            .await
+            .expect("migrate isolated P5 database");
+        let mut transaction = pool.begin().await.expect("coverage transaction");
+        let coverage =
+            ensure_partition_coverage(&mut transaction, 2, 2, &[], &StagedLoaderPublisher)
+                .await
+                .expect("partition coverage");
+        assert!(
+            matches!(coverage, CoverageOutcome::Ensured(_)),
+            "{coverage:?}"
+        );
+        transaction.commit().await.expect("commit coverage");
+        Self { admin, pool, name }
+    }
+
+    async fn drop(mut self) {
+        self.pool.close().await;
+        sqlx::query(&format!("DROP DATABASE \"{}\"", self.name))
+            .execute(&mut self.admin)
+            .await
+            .expect("drop isolated terminalization database");
+    }
+}
+
 static P5_DATABASE: OnceCell<P5TestDatabase> = OnceCell::const_new();
 
 pub(crate) async fn migrated_pool() -> PgPool {
@@ -1854,7 +1905,8 @@ async fn orphan_sweep_cancels_unlinked_and_retains_linked() {
 #[tokio::test]
 #[serial]
 async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
-    let pool = migrated_pool().await;
+    let database = IsolatedTerminalizationTestDatabase::create().await;
+    let pool = database.pool.clone();
     let workflow_id = Uuid::parse_str("30000000-0000-7000-8000-000000000001").unwrap();
     let orphan_id = Uuid::parse_str("40000000-0000-7000-8000-00000000c351").unwrap();
     sqlx::query("DELETE FROM horsies_workflow_tasks WHERE workflow_id = $1")
@@ -2215,6 +2267,8 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
         .execute(&pool)
         .await
         .unwrap();
+    drop(pool);
+    database.drop().await;
 }
 
 #[tokio::test]
