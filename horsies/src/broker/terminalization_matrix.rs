@@ -162,6 +162,11 @@ struct IsolatedTerminalizationTestDatabase {
 
 const ISOLATED_TERMINALIZATION_DATABASE_PREFIX: &str = "horsies_term_iso_";
 
+enum IsolatedTerminalizationDatabaseDrop {
+    InactiveOnly,
+    OwnedForced,
+}
+
 async fn lock_isolated_terminalization_database_setup(admin: &mut PgConnection) {
     sqlx::query("SELECT pg_advisory_lock(hashtext('horsies_terminalization_database_setup'))")
         .execute(admin)
@@ -182,7 +187,11 @@ async fn unlock_isolated_terminalization_database_setup(admin: &mut PgConnection
     );
 }
 
-async fn drop_isolated_terminalization_database(admin: &mut PgConnection, name: &str) {
+async fn drop_isolated_terminalization_database(
+    admin: &mut PgConnection,
+    name: &str,
+    mode: IsolatedTerminalizationDatabaseDrop,
+) {
     let suffix = name
         .strip_prefix(ISOLATED_TERMINALIZATION_DATABASE_PREFIX)
         .expect("database query must enforce the generated prefix");
@@ -190,7 +199,15 @@ async fn drop_isolated_terminalization_database(admin: &mut PgConnection, name: 
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "refuse to drop non-generated terminalization database {name:?}"
     );
-    sqlx::query(&format!("DROP DATABASE \"{name}\""))
+    let statement = match mode {
+        IsolatedTerminalizationDatabaseDrop::InactiveOnly => {
+            format!("DROP DATABASE \"{name}\"")
+        }
+        IsolatedTerminalizationDatabaseDrop::OwnedForced => {
+            format!("DROP DATABASE \"{name}\" WITH (FORCE)")
+        }
+    };
+    sqlx::query(&statement)
         .execute(admin)
         .await
         .expect("drop generated terminalization database");
@@ -212,7 +229,12 @@ async fn drop_inactive_isolated_terminalization_databases(admin: &mut PgConnecti
     .await
     .expect("list inactive isolated terminalization databases");
     for stale_database in stale_databases {
-        drop_isolated_terminalization_database(admin, &stale_database).await;
+        drop_isolated_terminalization_database(
+            admin,
+            &stale_database,
+            IsolatedTerminalizationDatabaseDrop::InactiveOnly,
+        )
+        .await;
     }
 }
 
@@ -258,7 +280,12 @@ impl IsolatedTerminalizationTestDatabase {
     async fn drop(mut self) {
         lock_isolated_terminalization_database_setup(&mut self.admin).await;
         self.pool.close().await;
-        drop_isolated_terminalization_database(&mut self.admin, &self.name).await;
+        drop_isolated_terminalization_database(
+            &mut self.admin,
+            &self.name,
+            IsolatedTerminalizationDatabaseDrop::OwnedForced,
+        )
+        .await;
         unlock_isolated_terminalization_database_setup(&mut self.admin).await;
     }
 }
@@ -386,6 +413,33 @@ async fn isolated_terminalization_setup_removes_an_inactive_generated_database()
             .expect("check inactive generated database cleanup");
     assert!(!stale_exists);
     database.drop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn owned_isolated_terminalization_drop_forces_a_remaining_session() {
+    let database = IsolatedTerminalizationTestDatabase::create().await;
+    let database_name = database.name.clone();
+    let base_options =
+        PgConnectOptions::from_str(&test_db_url()).expect("invalid terminalization database URL");
+    let remaining_session =
+        PgConnection::connect_with(&base_options.clone().database(&database_name))
+            .await
+            .expect("connect remaining isolated terminalization session");
+
+    database.drop().await;
+    drop(remaining_session);
+
+    let mut admin = PgConnection::connect_with(&base_options.database("postgres"))
+        .await
+        .expect("connect to terminalization admin database");
+    let database_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+            .bind(database_name)
+            .fetch_one(&mut admin)
+            .await
+            .expect("check owned generated database cleanup");
+    assert!(!database_exists);
 }
 
 pub(crate) async fn migrated_database_url() -> String {
