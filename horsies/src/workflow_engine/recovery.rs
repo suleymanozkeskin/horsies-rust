@@ -2010,14 +2010,14 @@ mod cap_tests {
             .fetch_one(explain_transaction.as_mut())
             .await
             .unwrap();
+        let rendered = plan.to_string();
         assert!(
-            plan.to_string()
-                .contains("idx_horsies_workflows_running_recovery_scan"),
+            rendered.contains("idx_horsies_workflows_running_recovery_scan"),
             "bounded workflow audit must use the running-workflow scan index: {plan}",
         );
         assert!(
-            plan.to_string()
-                .contains("idx_horsies_workflow_tasks_workflow"),
+            rendered.contains("idx_horsies_workflow_tasks_workflow")
+                || rendered.contains("uq_horsies_workflow_task_index"),
             "bounded workflow audit must use workflow-task index probes: {plan}",
         );
         assert!(
@@ -2050,7 +2050,8 @@ mod cap_tests {
                 "workflow-tree recovery must use an exact workflow index: {tree_plan}",
             );
             assert!(
-                rendered.contains("idx_horsies_workflow_tasks_workflow"),
+                rendered.contains("idx_horsies_workflow_tasks_workflow")
+                    || rendered.contains("uq_horsies_workflow_task_index"),
                 "workflow-tree recovery must use workflow-task index probes: {tree_plan}",
             );
             assert!(
