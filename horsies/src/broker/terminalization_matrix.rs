@@ -1972,6 +1972,34 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
     assert_eq!(first_stats, (500, 0));
 
     let mut explain_transaction = pool.begin().await.unwrap();
+    sqlx::query(
+        "WITH lower_bound AS (
+             SELECT created_at, id
+             FROM horsies_tasks
+             WHERE is_workflow_task = TRUE
+               AND status IN ('CLAIMED', 'PENDING')
+             ORDER BY created_at, id
+             OFFSET 49499 LIMIT 1
+         ),
+         upper_bound AS (
+             SELECT created_at, id
+             FROM horsies_tasks
+             WHERE is_workflow_task = TRUE
+               AND status IN ('CLAIMED', 'PENDING')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1
+         )
+         UPDATE horsies_recovery_scan_cursors cursor
+         SET last_created_at = lower_bound.created_at,
+             last_id = lower_bound.id,
+             cycle_upper_created_at = upper_bound.created_at,
+             cycle_upper_id = upper_bound.id
+         FROM lower_bound, upper_bound
+         WHERE cursor.scan_name = 'orphan_workflow_tasks'",
+    )
+    .execute(explain_transaction.as_mut())
+    .await
+    .unwrap();
     let production_plan: serde_json::Value = sqlx::query_scalar(
         "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
          SELECT * FROM horsies_cancel_orphaned_tasks(500)",
@@ -1980,8 +2008,8 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
     .await
     .unwrap();
     assert!(
-        root_shared_buffers(&production_plan) <= 20_000,
-        "orphan audit must stay within its physical buffer budget: {production_plan}",
+        root_shared_buffers(&production_plan) <= 3_500,
+        "the exact orphan function must not read the complete 50,001-row fixture: {production_plan}",
     );
     explain_transaction.rollback().await.unwrap();
 
