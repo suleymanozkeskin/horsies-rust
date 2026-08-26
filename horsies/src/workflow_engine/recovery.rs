@@ -401,6 +401,24 @@ SET status = 'FAILED',
 WHERE id = $1
   AND status = 'RUNNING'";
 
+const FAIL_ORPHANED_WORKFLOW_WITH_CLAIM_SQL: &str = "\
+WITH claim AS MATERIALIZED (
+    SELECT TRUE
+    FROM horsies_recovery_scan_cursors
+    WHERE scan_name = 'running_workflows'
+      AND claim_token = $3
+      AND claim_expires_at > statement_timestamp()
+    FOR SHARE
+)
+UPDATE horsies_workflows
+SET status = 'FAILED',
+    error = $2,
+    completed_at = NOW(),
+    updated_at = NOW()
+WHERE id = $1
+  AND status = 'RUNNING'
+  AND EXISTS (SELECT 1 FROM claim)";
+
 /// Re-enqueue a READY task into horsies_tasks.
 const ENQUEUE_TASK_SQL: &str = "\
 INSERT INTO horsies_tasks (
@@ -1117,15 +1135,27 @@ async fn recover_global_workflow_end_states(
             report.metrics.case2_3.refusals += 1;
             break;
         }
-        match engine::check_workflow_completion(pool, workflow_id, registry, payload, retention)
-            .await
+        match engine::check_workflow_completion_with_recovery_claim(
+            pool,
+            workflow_id,
+            registry,
+            payload,
+            retention,
+            claim_token.expect("candidate page has a claim token"),
+        )
+        .await
         {
-            Ok(()) => {
+            Ok(engine::RecoveryClaimOutcome::Held) => {
                 report.case2_3_workflow_completed += 1;
                 tracing::debug!(
                     workflow_id = %workflow_id,
                     "recovery case 2+3: triggered workflow completion check",
                 );
+            }
+            Ok(engine::RecoveryClaimOutcome::Lost) => {
+                owns_claim = false;
+                report.metrics.case2_3.refusals += 1;
+                break;
             }
             Err(e) => {
                 tracing::error!(
@@ -1159,7 +1189,14 @@ async fn recover_global_workflow_end_states(
                 report.metrics.case4.refusals += 1;
                 break;
             }
-            match fail_orphaned_workflow(pool, workflow_id, &name).await {
+            match fail_orphaned_workflow_with_claim(
+                pool,
+                workflow_id,
+                &name,
+                claim_token.expect("candidate page has a claim token"),
+            )
+            .await
+            {
                 Ok(true) => {
                     report.case4_orphaned_failed += 1;
                     tracing::warn!(
@@ -1324,6 +1361,32 @@ async fn fail_orphaned_workflow(
     workflow_id: Uuid,
     name: &str,
 ) -> Result<bool, sqlx::Error> {
+    let error_str = orphaned_workflow_error(name);
+    let result = sqlx::query(FAIL_ORPHANED_WORKFLOW_SQL)
+        .bind(workflow_id)
+        .bind(error_str)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+async fn fail_orphaned_workflow_with_claim(
+    pool: &PgPool,
+    workflow_id: Uuid,
+    name: &str,
+    claim_token: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let error_str = orphaned_workflow_error(name);
+    let result = sqlx::query(FAIL_ORPHANED_WORKFLOW_WITH_CLAIM_SQL)
+        .bind(workflow_id)
+        .bind(error_str)
+        .bind(claim_token)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+fn orphaned_workflow_error(name: &str) -> String {
     let error_json = serde_json::json!({
         "error_code": "E400",
         "message": format!(
@@ -1333,13 +1396,7 @@ async fn fail_orphaned_workflow(
         ),
         "recovery": "case_4",
     });
-    let error_str = serde_json::to_string(&error_json).unwrap_or_else(|_| "{}".to_owned());
-    let result = sqlx::query(FAIL_ORPHANED_WORKFLOW_SQL)
-        .bind(workflow_id)
-        .bind(error_str)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected() == 1)
+    serde_json::to_string(&error_json).unwrap_or_else(|_| "{}".to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -1830,7 +1887,7 @@ mod cap_tests {
         )
         .await
         .unwrap();
-        assert_eq!(report.case4_orphaned_failed, 2);
+        assert_eq!(report.case4_orphaned_failed, 2, "{report:?}");
         assert_eq!(failed_count(&pool, &ids).await, 2);
 
         // Uncapped: the remaining orphan is failed.
@@ -2363,6 +2420,165 @@ mod cap_tests {
         .await
         .unwrap();
         assert_eq!(report.case2_3_workflow_completed, 1);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM horsies_workflows WHERE id = $1")
+                .bind(workflow_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "COMPLETED");
+
+        sqlx::query("DELETE FROM horsies_workflow_tasks WHERE workflow_id = $1")
+            .bind(workflow_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM horsies_workflows WHERE id = $1")
+            .bind(workflow_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn workflow_action_fences_the_claim_after_lease_expiry() {
+        let pool = crate::broker::terminalization_matrix::migrated_pool().await;
+        sqlx::query("DELETE FROM horsies_workflow_tasks")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM horsies_workflows")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE horsies_recovery_scan_cursors
+             SET last_created_at = NULL, last_id = NULL,
+                 cycle_upper_created_at = NULL, cycle_upper_id = NULL,
+                 claim_token = NULL, claim_expires_at = NULL,
+                 completed_cycles = 0, last_scan_rows = 0,
+                 last_candidate_rows = 0, last_scan_at = NULL
+             WHERE scan_name = 'running_workflows'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let workflow_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO horsies_workflows (
+                 id, name, status, on_error, output_task_index,
+                 definition_key, depth, root_workflow_id,
+                 sent_at, created_at, started_at, updated_at
+             ) VALUES (
+                 $1, 'bounded_recovery_fenced', 'RUNNING', 'fail', NULL,
+                 $2, 0, $1, NOW(), NOW(), NOW(), NOW()
+             )",
+        )
+        .bind(workflow_id)
+        .bind(format!("test.bounded-recovery.fenced.{workflow_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO horsies_workflow_tasks (
+                 id, workflow_id, task_index, node_id, task_name,
+                 queue_name, priority, dependencies, allow_failed_deps,
+                 join_type, status, is_subworkflow, completed_at, created_at
+             ) VALUES (
+                 $1, $2, 0, 'root', 'bounded_recovery_fenced_task',
+                 'default', 100, '{}'::integer[], FALSE,
+                 'all', 'COMPLETED', FALSE, NOW(), NOW()
+             )",
+        )
+        .bind(Uuid::new_v4())
+        .bind(workflow_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let audit = sqlx::query_as::<_, GlobalWorkflowAuditRow>(GLOBAL_WORKFLOW_AUDIT_SQL)
+            .bind(200_i64)
+            .bind(Uuid::new_v4())
+            .bind(500_i64)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let claim_token = audit.claim_token.expect("candidate page claim");
+
+        let mut workflow_lock = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM horsies_workflows WHERE id = $1 FOR UPDATE")
+            .bind(workflow_id)
+            .execute(workflow_lock.as_mut())
+            .await
+            .unwrap();
+        let action_pool = pool.clone();
+        let action = tokio::spawn(async move {
+            engine::check_workflow_completion_with_recovery_claim(
+                &action_pool,
+                workflow_id,
+                &WorkflowSpecRegistry::new(),
+                &PayloadPolicy::default(),
+                &RetentionConfig::default(),
+                claim_token,
+            )
+            .await
+        });
+
+        let mut action_is_waiting = false;
+        for _ in 0..100 {
+            action_is_waiting = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND pid <> pg_backend_pid()
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE 'SELECT id FROM horsies_workflows%FOR UPDATE%'
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if action_is_waiting {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            action_is_waiting,
+            "candidate action must reach the workflow lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(550)).await;
+        let lease_expired: bool = sqlx::query_scalar(
+            "SELECT claim_expires_at <= statement_timestamp()
+             FROM horsies_recovery_scan_cursors
+             WHERE scan_name = 'running_workflows'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(lease_expired);
+
+        let mut second = RecoveryReport::default();
+        recover_global_workflow_end_states(
+            &pool,
+            &WorkflowSpecRegistry::new(),
+            Some(200),
+            &mut second,
+            &PayloadPolicy::default(),
+            &RetentionConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.metrics.case2_3.refusals, 1);
+        assert_eq!(second.case2_3_workflow_completed, 0);
+
+        workflow_lock.rollback().await.unwrap();
+        assert_eq!(
+            action.await.unwrap().unwrap(),
+            engine::RecoveryClaimOutcome::Held
+        );
         let status: String =
             sqlx::query_scalar("SELECT status FROM horsies_workflows WHERE id = $1")
                 .bind(workflow_id)
