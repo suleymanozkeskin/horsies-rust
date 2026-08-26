@@ -1,24 +1,149 @@
-CREATE TABLE IF NOT EXISTS horsies_recovery_scan_cursors (
-    scan_name varchar(64) PRIMARY KEY,
-    last_id uuid,
-    completed_cycles bigint NOT NULL DEFAULT 0,
-    last_scan_rows integer NOT NULL DEFAULT 0,
-    last_candidate_rows integer NOT NULL DEFAULT 0,
-    last_scan_at timestamptz
-);
+DO $migration$
+DECLARE
+    v_actual jsonb;
+    v_expected jsonb;
+BEGIN
+    CREATE TEMP TABLE horsies_expected_workflow_recovery_index
+        ON COMMIT DROP
+        AS SELECT created_at, id, name, status
+           FROM horsies_workflows WITH NO DATA;
+    CREATE INDEX horsies_expected_workflow_recovery_index_idx
+        ON horsies_expected_workflow_recovery_index (created_at, id)
+        INCLUDE (name)
+        WHERE status = 'RUNNING';
 
-INSERT INTO horsies_recovery_scan_cursors (scan_name)
-VALUES ('running_workflows'), ('orphan_workflow_tasks')
-ON CONFLICT (scan_name) DO NOTHING;
+    SELECT jsonb_build_object(
+               'method', am.amname,
+               'valid', i.indisvalid,
+               'ready', i.indisready,
+               'live', i.indislive,
+               'unique', i.indisunique,
+               'exclusion', i.indisexclusion,
+               'immediate', i.indimmediate,
+               'key_count', i.indnkeyatts,
+               'attribute_count', i.indnatts,
+               'has_expressions', i.indexprs IS NOT NULL,
+               'columns', (
+                   SELECT jsonb_agg(pg_get_indexdef(i.indexrelid, n, FALSE)
+                                    ORDER BY n)
+                   FROM generate_series(1, i.indnatts) AS n
+               ),
+               'operator_classes', to_jsonb(i.indclass::oid[]),
+               'collations', to_jsonb(i.indcollation::oid[]),
+               'options', to_jsonb(i.indoption::smallint[]),
+               'predicate', pg_get_expr(i.indpred, i.indrelid)
+           )
+    INTO v_expected
+    FROM pg_index AS i
+    JOIN pg_class AS ic ON ic.oid = i.indexrelid
+    JOIN pg_am AS am ON am.oid = ic.relam
+    WHERE ic.oid = to_regclass('horsies_expected_workflow_recovery_index_idx');
 
-CREATE INDEX IF NOT EXISTS idx_horsies_workflows_running_recovery_scan
-    ON horsies_workflows (id) INCLUDE (name)
-    WHERE status = 'RUNNING';
+    SELECT jsonb_build_object(
+               'method', am.amname,
+               'valid', i.indisvalid,
+               'ready', i.indisready,
+               'live', i.indislive,
+               'unique', i.indisunique,
+               'exclusion', i.indisexclusion,
+               'immediate', i.indimmediate,
+               'key_count', i.indnkeyatts,
+               'attribute_count', i.indnatts,
+               'has_expressions', i.indexprs IS NOT NULL,
+               'columns', (
+                   SELECT jsonb_agg(pg_get_indexdef(i.indexrelid, n, FALSE)
+                                    ORDER BY n)
+                   FROM generate_series(1, i.indnatts) AS n
+               ),
+               'operator_classes', to_jsonb(i.indclass::oid[]),
+               'collations', to_jsonb(i.indcollation::oid[]),
+               'options', to_jsonb(i.indoption::smallint[]),
+               'predicate', pg_get_expr(i.indpred, i.indrelid)
+           )
+    INTO v_actual
+    FROM pg_index AS i
+    JOIN pg_class AS ic ON ic.oid = i.indexrelid
+    JOIN pg_am AS am ON am.oid = ic.relam
+    WHERE ic.oid = to_regclass('idx_horsies_workflows_running_recovery_scan')
+      AND i.indrelid = 'horsies_workflows'::regclass;
 
-CREATE INDEX IF NOT EXISTS idx_horsies_tasks_orphan_recovery_scan
-    ON horsies_tasks (id)
-    WHERE is_workflow_task = TRUE
-      AND status IN ('CLAIMED', 'PENDING');
+    IF v_actual IS DISTINCT FROM v_expected THEN
+        RAISE EXCEPTION
+            'idx_horsies_workflows_running_recovery_scan is absent, invalid, or noncanonical'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+
+    CREATE TEMP TABLE horsies_expected_task_recovery_index
+        ON COMMIT DROP
+        AS SELECT created_at, id, is_workflow_task, status
+           FROM horsies_tasks WITH NO DATA;
+    CREATE INDEX horsies_expected_task_recovery_index_idx
+        ON horsies_expected_task_recovery_index (created_at, id)
+        WHERE is_workflow_task = TRUE
+          AND status IN ('CLAIMED', 'PENDING');
+
+    SELECT jsonb_build_object(
+               'method', am.amname,
+               'valid', i.indisvalid,
+               'ready', i.indisready,
+               'live', i.indislive,
+               'unique', i.indisunique,
+               'exclusion', i.indisexclusion,
+               'immediate', i.indimmediate,
+               'key_count', i.indnkeyatts,
+               'attribute_count', i.indnatts,
+               'has_expressions', i.indexprs IS NOT NULL,
+               'columns', (
+                   SELECT jsonb_agg(pg_get_indexdef(i.indexrelid, n, FALSE)
+                                    ORDER BY n)
+                   FROM generate_series(1, i.indnatts) AS n
+               ),
+               'operator_classes', to_jsonb(i.indclass::oid[]),
+               'collations', to_jsonb(i.indcollation::oid[]),
+               'options', to_jsonb(i.indoption::smallint[]),
+               'predicate', pg_get_expr(i.indpred, i.indrelid)
+           )
+    INTO v_expected
+    FROM pg_index AS i
+    JOIN pg_class AS ic ON ic.oid = i.indexrelid
+    JOIN pg_am AS am ON am.oid = ic.relam
+    WHERE ic.oid = to_regclass('horsies_expected_task_recovery_index_idx');
+
+    SELECT jsonb_build_object(
+               'method', am.amname,
+               'valid', i.indisvalid,
+               'ready', i.indisready,
+               'live', i.indislive,
+               'unique', i.indisunique,
+               'exclusion', i.indisexclusion,
+               'immediate', i.indimmediate,
+               'key_count', i.indnkeyatts,
+               'attribute_count', i.indnatts,
+               'has_expressions', i.indexprs IS NOT NULL,
+               'columns', (
+                   SELECT jsonb_agg(pg_get_indexdef(i.indexrelid, n, FALSE)
+                                    ORDER BY n)
+                   FROM generate_series(1, i.indnatts) AS n
+               ),
+               'operator_classes', to_jsonb(i.indclass::oid[]),
+               'collations', to_jsonb(i.indcollation::oid[]),
+               'options', to_jsonb(i.indoption::smallint[]),
+               'predicate', pg_get_expr(i.indpred, i.indrelid)
+           )
+    INTO v_actual
+    FROM pg_index AS i
+    JOIN pg_class AS ic ON ic.oid = i.indexrelid
+    JOIN pg_am AS am ON am.oid = ic.relam
+    WHERE ic.oid = to_regclass('idx_horsies_tasks_orphan_recovery_scan')
+      AND i.indrelid = 'horsies_tasks'::regclass;
+
+    IF v_actual IS DISTINCT FROM v_expected THEN
+        RAISE EXCEPTION
+            'idx_horsies_tasks_orphan_recovery_scan is absent, invalid, or noncanonical'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+END
+$migration$;
 
 CREATE OR REPLACE FUNCTION horsies_cancel_orphaned_tasks(
     p_batch_size integer
@@ -27,12 +152,15 @@ RETURNS SETOF horsies_terminalization_outcome
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_cursor uuid;
+    v_cursor_created_at timestamptz;
+    v_cursor_id uuid;
+    v_upper_created_at timestamptz;
+    v_upper_id uuid;
+    v_scan_created_at timestamptz[];
     v_scan_ids uuid[];
-    v_wrap_ids uuid[];
     v_ids uuid[];
     v_scan_count integer;
-    v_wrapped boolean := FALSE;
+    v_cycle_complete boolean;
     v_terminal_at timestamptz;
     v_moved bigint;
     v_deleted bigint;
@@ -45,7 +173,10 @@ BEGIN
     END IF;
     PERFORM horsies_assert_archive_available();
 
-    SELECT c.last_id INTO v_cursor
+    SELECT c.last_created_at, c.last_id,
+           c.cycle_upper_created_at, c.cycle_upper_id
+    INTO v_cursor_created_at, v_cursor_id,
+         v_upper_created_at, v_upper_id
     FROM horsies_recovery_scan_cursors c
     WHERE c.scan_name = 'orphan_workflow_tasks'
     FOR UPDATE NOWAIT;
@@ -54,34 +185,40 @@ BEGIN
             USING ERRCODE = 'data_corrupted';
     END IF;
 
-    SELECT array_agg(s.id ORDER BY s.id) INTO v_scan_ids
-    FROM (
-        SELECT t.id
+    IF v_upper_id IS NULL THEN
+        SELECT t.created_at, t.id
+        INTO v_upper_created_at, v_upper_id
         FROM horsies_tasks t
         WHERE t.is_workflow_task = TRUE
           AND t.status IN ('CLAIMED', 'PENDING')
-          AND (v_cursor IS NULL OR t.id > v_cursor)
-        ORDER BY t.id
+        ORDER BY t.created_at DESC, t.id DESC
+        LIMIT 1;
+    END IF;
+
+    SELECT array_agg(s.created_at ORDER BY s.created_at, s.id),
+           array_agg(s.id ORDER BY s.created_at, s.id)
+    INTO v_scan_created_at, v_scan_ids
+    FROM (
+        SELECT t.created_at, t.id
+        FROM horsies_tasks t
+        WHERE t.is_workflow_task = TRUE
+          AND t.status IN ('CLAIMED', 'PENDING')
+          AND v_upper_id IS NOT NULL
+          AND (
+              v_cursor_id IS NULL
+              OR (t.created_at, t.id) > (v_cursor_created_at, v_cursor_id)
+          )
+          AND (t.created_at, t.id) <= (v_upper_created_at, v_upper_id)
+        ORDER BY t.created_at, t.id
         LIMIT p_batch_size
     ) s;
     v_scan_count := COALESCE(cardinality(v_scan_ids), 0);
-
-    IF v_cursor IS NOT NULL AND v_scan_count < p_batch_size THEN
-        SELECT array_agg(s.id ORDER BY s.id) INTO v_wrap_ids
-        FROM (
-            SELECT t.id
-            FROM horsies_tasks t
-            WHERE t.is_workflow_task = TRUE
-              AND t.status IN ('CLAIMED', 'PENDING')
-              AND t.id <= v_cursor
-            ORDER BY t.id
-            LIMIT p_batch_size - v_scan_count
-        ) s;
-        v_scan_ids := COALESCE(v_scan_ids, '{}'::uuid[])
-            || COALESCE(v_wrap_ids, '{}'::uuid[]);
-        v_scan_count := cardinality(v_scan_ids);
-        v_wrapped := TRUE;
-    END IF;
+    v_cycle_complete := v_scan_count < p_batch_size
+        OR (
+            v_scan_count > 0
+            AND (v_scan_created_at[v_scan_count], v_scan_ids[v_scan_count])
+                = (v_upper_created_at, v_upper_id)
+        );
 
     SELECT array_agg(s.id ORDER BY s.id) INTO v_ids
     FROM (
@@ -107,11 +244,14 @@ BEGIN
     ) s;
 
     UPDATE horsies_recovery_scan_cursors
-    SET last_id = CASE
-            WHEN v_scan_count = 0 THEN NULL
-            ELSE v_scan_ids[v_scan_count]
-        END,
-        completed_cycles = completed_cycles + CASE WHEN v_wrapped THEN 1 ELSE 0 END,
+    SET last_created_at = CASE WHEN v_cycle_complete THEN NULL
+                               ELSE v_scan_created_at[v_scan_count] END,
+        last_id = CASE WHEN v_cycle_complete THEN NULL
+                       ELSE v_scan_ids[v_scan_count] END,
+        cycle_upper_created_at = CASE WHEN v_cycle_complete THEN NULL
+                                      ELSE v_upper_created_at END,
+        cycle_upper_id = CASE WHEN v_cycle_complete THEN NULL ELSE v_upper_id END,
+        completed_cycles = completed_cycles + CASE WHEN v_cycle_complete THEN 1 ELSE 0 END,
         last_scan_rows = v_scan_count,
         last_candidate_rows = COALESCE(cardinality(v_ids), 0),
         last_scan_at = statement_timestamp()

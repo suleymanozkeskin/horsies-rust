@@ -417,3 +417,37 @@ where
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod recovery_index_migration_tests {
+    const WORKFLOW_INDEX: &str =
+        include_str!("../../migrations/0046_running_workflow_recovery_index.sql");
+    const TASK_INDEX: &str = include_str!("../../migrations/0047_orphan_task_recovery_index.sql");
+    const VALIDATION_AND_FUNCTION: &str =
+        include_str!("../../migrations/0048_bounded_recovery_function.sql");
+
+    #[test]
+    fn recovery_indexes_are_concurrent_and_validated_before_function_install() {
+        for migration in [WORKFLOW_INDEX, TASK_INDEX] {
+            assert!(migration.starts_with("-- no-transaction\n"));
+            assert!(migration.contains("CREATE INDEX CONCURRENTLY IF NOT EXISTS"));
+        }
+        let validation = VALIDATION_AND_FUNCTION
+            .find("DO $migration$")
+            .expect("index validation block");
+        let function = VALIDATION_AND_FUNCTION
+            .find("CREATE OR REPLACE FUNCTION horsies_cancel_orphaned_tasks")
+            .expect("bounded orphan function");
+        assert!(validation < function);
+        for required_shape_check in [
+            "'valid', i.indisvalid",
+            "'ready', i.indisready",
+            "'live', i.indislive",
+            "'operator_classes', to_jsonb(i.indclass::oid[])",
+            "'collations', to_jsonb(i.indcollation::oid[])",
+            "'predicate', pg_get_expr(i.indpred, i.indrelid)",
+        ] {
+            assert!(VALIDATION_AND_FUNCTION.contains(required_shape_check));
+        }
+    }
+}

@@ -1102,7 +1102,7 @@ async fn run_reaper_pass(
 
     // Exact outbox recovery. Each candidate owns its transaction; retaining
     // dispositions remain visible and count toward bounded quarantine.
-    let workflow_recovery = crate::workflow_engine::recovery::recover_stuck_workflows(
+    let workflow_recovery = crate::workflow_engine::recovery::recover_stuck_workflows_observed(
         runtime_pool,
         registry,
         config.crashed_worker_recovery_grace_ms,
@@ -1114,9 +1114,9 @@ async fn run_reaper_pass(
         Ok(report) => serde_json::to_value(report).unwrap_or_else(
             |error| serde_json::json!({"state": "error", "error": error.to_string()}),
         ),
-        Err(error) => {
-            tracing::error!(%error, "workflow recovery pass failed");
-            serde_json::json!({"state": "error", "error": error.to_string()})
+        Err(failure) => {
+            tracing::error!(error = %failure.error, "workflow recovery pass failed");
+            failure.into_health_snapshot()
         }
     });
 

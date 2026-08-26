@@ -77,6 +77,14 @@ fn plan_has_sequential_scan(plan: &serde_json::Value, relation: &str) -> bool {
     }
 }
 
+fn root_shared_buffers(plan: &serde_json::Value) -> u64 {
+    let root = &plan[0]["Plan"];
+    ["Shared Hit Blocks", "Shared Read Blocks"]
+        .into_iter()
+        .map(|field| root[field].as_u64().unwrap_or(0))
+        .sum()
+}
+
 fn test_db_url() -> String {
     if let Ok(url) = std::env::var("DATABASE_URL") {
         return url;
@@ -306,6 +314,31 @@ async fn seed_wf_task(pool: &PgPool, wf_id: &str, task_id: &str, status: &str) {
     .execute(pool)
     .await
     .expect("seed workflow task");
+}
+
+async fn seed_linked_workflow_task_at(
+    pool: &PgPool,
+    workflow_id: &str,
+    task_id: &str,
+    created_at: DateTime<Utc>,
+) {
+    seed_task(
+        pool,
+        task_id,
+        Seed {
+            status: "PENDING",
+            is_workflow_task: true,
+            ..Seed::default()
+        },
+    )
+    .await;
+    sqlx::query("UPDATE horsies_tasks SET created_at = $2 WHERE id = $1")
+        .bind(uuid(task_id))
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("set task scan order");
+    seed_wf_task(pool, workflow_id, task_id, "PENDING").await;
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1802,7 +1835,10 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
         .unwrap();
     sqlx::query(
         "UPDATE horsies_recovery_scan_cursors
-         SET last_id = NULL, completed_cycles = 0,
+         SET last_created_at = NULL, last_id = NULL,
+             cycle_upper_created_at = NULL, cycle_upper_id = NULL,
+             claim_token = NULL, claim_expires_at = NULL,
+             completed_cycles = 0,
              last_scan_rows = 0, last_candidate_rows = 0,
              last_scan_at = NULL
          WHERE scan_name = 'orphan_workflow_tasks'",
@@ -1892,13 +1928,27 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
     .unwrap();
     assert_eq!(first_stats, (500, 0));
 
+    let mut explain_transaction = pool.begin().await.unwrap();
+    let production_plan: serde_json::Value = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+         SELECT * FROM horsies_cancel_orphaned_tasks(500)",
+    )
+    .fetch_one(explain_transaction.as_mut())
+    .await
+    .unwrap();
+    assert!(
+        root_shared_buffers(&production_plan) <= 20_000,
+        "orphan audit must stay within its physical buffer budget: {production_plan}",
+    );
+    explain_transaction.rollback().await.unwrap();
+
     let plan: serde_json::Value = sqlx::query_scalar(
         "EXPLAIN (FORMAT JSON)
          WITH scanned AS MATERIALIZED (
-             SELECT id FROM horsies_tasks
+             SELECT created_at, id FROM horsies_tasks
              WHERE is_workflow_task = TRUE
                AND status IN ('CLAIMED', 'PENDING')
-             ORDER BY id LIMIT 500
+             ORDER BY created_at, id LIMIT 500
          )
          SELECT candidate.id
          FROM scanned s
@@ -1978,6 +2028,10 @@ async fn orphan_sweep_cursor_bounds_and_completes_a_fifty_thousand_row_audit() {
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("ANALYZE horsies_tasks, horsies_workflow_tasks")
+        .execute(&pool)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1988,7 +2042,10 @@ async fn orphan_sweep_rollback_keeps_the_candidate_for_the_next_audit() {
     cleanup(&pool, &[task_id]).await;
     sqlx::query(
         "UPDATE horsies_recovery_scan_cursors
-         SET last_id = NULL, completed_cycles = 0,
+         SET last_created_at = NULL, last_id = NULL,
+             cycle_upper_created_at = NULL, cycle_upper_id = NULL,
+             claim_token = NULL, claim_expires_at = NULL,
+             completed_cycles = 0,
              last_scan_rows = 0, last_candidate_rows = 0,
              last_scan_at = NULL
          WHERE scan_name = 'orphan_workflow_tasks'",
@@ -2057,6 +2114,95 @@ async fn orphan_sweep_cursor_lock_refuses_a_concurrent_audit() {
         "lock refusal must be retryable: {error}"
     );
     holder.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn orphan_cycle_watermark_revisits_old_rows_while_new_rows_arrive() {
+    let pool = migrated_pool().await;
+    let workflow_id = Uuid::new_v4().to_string();
+    let task_ids: Vec<String> = (0..7).map(|_| Uuid::new_v4().to_string()).collect();
+    cleanup(
+        &pool,
+        &task_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    seed_workflow(&pool, &workflow_id, "RUNNING").await;
+    sqlx::query(
+        "UPDATE horsies_recovery_scan_cursors
+         SET last_created_at = NULL, last_id = NULL,
+             cycle_upper_created_at = NULL, cycle_upper_id = NULL,
+             claim_token = NULL, claim_expires_at = NULL,
+             completed_cycles = 0, last_scan_rows = 0,
+             last_candidate_rows = 0, last_scan_at = NULL
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let base = Utc::now() - chrono::Duration::hours(1);
+    for (offset, task_id) in task_ids[..3].iter().enumerate() {
+        seed_linked_workflow_task_at(
+            &pool,
+            &workflow_id,
+            task_id,
+            base + chrono::Duration::seconds(i64::try_from(offset).unwrap()),
+        )
+        .await;
+    }
+    let command = TerminalizationCommand::CancelOrphanedTasks {
+        batch_size: BatchSize::new(2).unwrap(),
+    };
+    assert!(terminalize(&pool, &command).await.unwrap().is_empty());
+
+    sqlx::query("DELETE FROM horsies_workflow_tasks WHERE task_id = $1")
+        .bind(uuid(&task_ids[0]))
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (offset, task_id) in task_ids[3..5].iter().enumerate() {
+        seed_linked_workflow_task_at(
+            &pool,
+            &workflow_id,
+            task_id,
+            base + chrono::Duration::minutes(10)
+                + chrono::Duration::seconds(i64::try_from(offset).unwrap()),
+        )
+        .await;
+    }
+
+    assert!(terminalize(&pool, &command).await.unwrap().is_empty());
+    let second_rows: i32 = sqlx::query_scalar(
+        "SELECT last_scan_rows FROM horsies_recovery_scan_cursors
+         WHERE scan_name = 'orphan_workflow_tasks'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(second_rows, 1);
+
+    for (offset, task_id) in task_ids[5..].iter().enumerate() {
+        seed_linked_workflow_task_at(
+            &pool,
+            &workflow_id,
+            task_id,
+            base + chrono::Duration::minutes(20)
+                + chrono::Duration::seconds(i64::try_from(offset).unwrap()),
+        )
+        .await;
+    }
+    let third = terminalize(&pool, &command).await.unwrap();
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].task_id(), uuid(&task_ids[0]));
+    assert_eq!(post_image(&pool, &task_ids[0]).await.status, "CANCELLED");
+
+    cleanup(
+        &pool,
+        &task_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+    )
+    .await;
+    cleanup_workflow(&pool, &workflow_id).await;
 }
 
 // ---------------------------------------------------------------------------
