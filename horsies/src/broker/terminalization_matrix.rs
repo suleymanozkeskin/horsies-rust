@@ -256,8 +256,8 @@ impl IsolatedTerminalizationTestDatabase {
     }
 
     async fn drop(mut self) {
-        self.pool.close().await;
         lock_isolated_terminalization_database_setup(&mut self.admin).await;
+        self.pool.close().await;
         drop_isolated_terminalization_database(&mut self.admin, &self.name).await;
         unlock_isolated_terminalization_database_setup(&mut self.admin).await;
     }
