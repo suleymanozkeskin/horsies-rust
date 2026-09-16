@@ -11,6 +11,9 @@ pub struct PostgresConfig {
     ///
     /// This may point at a PgBouncer transaction-pool endpoint when
     /// `pgbouncer_transaction_mode` is true.
+    /// Otherwise, each connection caches up to 256 statements by default.
+    /// The URL option `statement-cache-capacity` overrides this value.
+    /// Direct connections have a two-hour maximum lifetime.
     pub database_url: String,
 
     /// PostgreSQL session connection URL for schema initialization,
@@ -33,7 +36,9 @@ pub struct PostgresConfig {
     #[serde(default)]
     pub pgbouncer_transaction_mode: bool,
 
-    /// Whether to pre-ping the connection pool.
+    /// Check connections before reuse after at least 60 seconds idle.
+    /// Transaction-mode pools keep a check before every acquire.
+    /// False disables these checks.
     #[serde(default = "default_true")]
     pub pool_pre_ping: bool,
 
@@ -53,7 +58,7 @@ pub struct PostgresConfig {
     #[serde(default = "default_pool_timeout")]
     pub pool_timeout: u32,
 
-    /// Seconds before a connection is recycled.
+    /// Seconds an unused connection can remain idle in the pool.
     #[serde(default = "default_pool_recycle")]
     pub pool_recycle: u32,
 

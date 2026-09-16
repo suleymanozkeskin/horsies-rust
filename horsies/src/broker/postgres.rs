@@ -5,8 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
-use sqlx::{ConnectOptions, FromRow, Postgres, Transaction};
-use std::str::FromStr;
+use sqlx::{ConnectOptions, Connection, FromRow, PgConnection, Postgres, Transaction};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -46,6 +45,10 @@ use crate::broker::row::task::{
 };
 
 use crate::broker::shared_listener::SharedNotifyListener;
+
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod connection_tests;
 
 #[cfg(test)]
 fn test_uuid(value: &str) -> Uuid {
@@ -535,41 +538,87 @@ const HEALTH_CHECK_SQL: &str = "SELECT 1";
 // number of long-lived LISTEN connections.
 const SESSION_POOL_MAX_CONNECTIONS: u32 = 4;
 
+const DIRECT_STATEMENT_CACHE_CAPACITY: usize = 256;
+const DIRECT_CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60);
+const CONNECTION_PING_IDLE_THRESHOLD: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy)]
+enum ConnectionMode {
+    Direct,
+    Transaction,
+    TransactionSession,
+}
+
 fn pg_connect_options(
     database_url: &str,
-    echo: bool,
-    pgbouncer_transaction_mode: bool,
-) -> Result<PgConnectOptions, BrokerError> {
-    let mut connect_options = PgConnectOptions::from_str(database_url)
-        .map_err(|e| BrokerError::ConnectionFailed(e.to_string()))?;
+    echo: Option<bool>,
+    mode: ConnectionMode,
+) -> Result<PgConnectOptions, sqlx::Error> {
+    let url = url::Url::parse(database_url).map_err(sqlx::Error::config)?;
+    let connect_options = PgConnectOptions::from_url(&url)?;
+    let connect_options = match echo {
+        Some(true) => connect_options.log_statements(log::LevelFilter::Debug),
+        Some(false) => connect_options.log_statements(log::LevelFilter::Off),
+        None => connect_options,
+    };
 
-    if echo {
-        connect_options = connect_options.log_statements(log::LevelFilter::Debug);
-    } else {
-        connect_options = connect_options.log_statements(log::LevelFilter::Off);
+    Ok(match mode {
+        ConnectionMode::Direct
+            if !url
+                .query_pairs()
+                .any(|(key, _)| key == "statement-cache-capacity") =>
+        {
+            connect_options.statement_cache_capacity(DIRECT_STATEMENT_CACHE_CAPACITY)
+        }
+        ConnectionMode::Transaction => connect_options.statement_cache_capacity(0),
+        ConnectionMode::Direct | ConnectionMode::TransactionSession => connect_options,
+    })
+}
+
+async fn ping_after_idle(
+    connection: &mut PgConnection,
+    idle_for: Duration,
+) -> Result<bool, sqlx::Error> {
+    if idle_for >= CONNECTION_PING_IDLE_THRESHOLD {
+        connection.ping().await?;
     }
+    Ok(true)
+}
 
-    if pgbouncer_transaction_mode {
-        connect_options = connect_options.statement_cache_capacity(0);
+fn direct_pool_options(options: PgPoolOptions, pre_ping: bool) -> PgPoolOptions {
+    let options = options
+        .max_lifetime(DIRECT_CONNECTION_MAX_LIFETIME)
+        .test_before_acquire(false);
+    match pre_ping {
+        true => options.before_acquire(|connection, metadata| {
+            Box::pin(ping_after_idle(connection, metadata.idle_for))
+        }),
+        false => options,
     }
-
-    Ok(connect_options)
 }
 
 fn pg_pool_options(config: &PostgresConfig) -> PgPoolOptions {
-    PgPoolOptions::new()
+    let options = PgPoolOptions::new()
         .max_connections(config.pool_size + config.max_overflow)
         .acquire_timeout(Duration::from_secs(config.pool_timeout as u64))
         .idle_timeout(Duration::from_secs(config.pool_recycle as u64))
-        .test_before_acquire(config.pool_pre_ping)
+        .test_before_acquire(config.pool_pre_ping);
+    match config.pgbouncer_transaction_mode {
+        true => options,
+        false => direct_pool_options(options, config.pool_pre_ping),
+    }
 }
 
 fn pg_session_pool_options(config: &PostgresConfig) -> PgPoolOptions {
-    PgPoolOptions::new()
+    let options = PgPoolOptions::new()
         .max_connections(SESSION_POOL_MAX_CONNECTIONS)
         .acquire_timeout(Duration::from_secs(config.pool_timeout as u64))
         .idle_timeout(Duration::from_secs(config.pool_recycle as u64))
-        .test_before_acquire(config.pool_pre_ping)
+        .test_before_acquire(config.pool_pre_ping);
+    match config.pgbouncer_transaction_mode {
+        true => options,
+        false => direct_pool_options(options, config.pool_pre_ping),
+    }
 }
 
 fn listener_probe_failed(err: sqlx::Error) -> BrokerError {
@@ -713,8 +762,15 @@ impl PostgresBroker {
     }
 
     /// Connect using a raw database URL.
+    ///
+    /// Each connection caches up to 256 statements by default. The URL option
+    /// `statement-cache-capacity` overrides this value. Connections have a
+    /// two-hour maximum lifetime and are checked after 60 seconds idle.
     pub async fn connect(database_url: &str) -> Result<Self, BrokerError> {
-        let pool = PgPool::connect(database_url)
+        let connect_options = pg_connect_options(database_url, None, ConnectionMode::Direct)
+            .map_err(BrokerError::Database)?;
+        let pool = direct_pool_options(PgPoolOptions::new(), true)
+            .connect_with(connect_options)
             .await
             .map_err(BrokerError::Database)?;
         Ok(Self::from_pool(pool))
@@ -745,9 +801,13 @@ impl PostgresBroker {
             .map_err(|err| BrokerError::ConnectionFailed(err.to_string()))?;
         let connect_options = pg_connect_options(
             &config.database_url,
-            config.echo,
-            config.pgbouncer_transaction_mode,
-        )?;
+            Some(config.echo),
+            match config.pgbouncer_transaction_mode {
+                true => ConnectionMode::Transaction,
+                false => ConnectionMode::Direct,
+            },
+        )
+        .map_err(|error| BrokerError::ConnectionFailed(error.to_string()))?;
         let pool = pg_pool_options(config)
             .connect_with(connect_options)
             .await
@@ -756,8 +816,15 @@ impl PostgresBroker {
         let session_pool = if config.effective_session_database_url() == config.database_url {
             pool.clone()
         } else {
-            let session_options =
-                pg_connect_options(config.effective_session_database_url(), config.echo, false)?;
+            let session_options = pg_connect_options(
+                config.effective_session_database_url(),
+                Some(config.echo),
+                match config.pgbouncer_transaction_mode {
+                    true => ConnectionMode::TransactionSession,
+                    false => ConnectionMode::Direct,
+                },
+            )
+            .map_err(|error| BrokerError::ConnectionFailed(error.to_string()))?;
             pg_session_pool_options(config)
                 .connect_with(session_options)
                 .await
